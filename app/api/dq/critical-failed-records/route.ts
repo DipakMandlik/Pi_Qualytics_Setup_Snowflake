@@ -5,6 +5,10 @@ import {
   ensureConnectionContext,
 } from "@/lib/snowflake";
 import { getServerConfig } from "@/lib/server-config";
+import { createErrorResponse } from '@/lib/errors';
+import { logger } from '@/lib/logger';
+import { retryQuery } from '@/lib/retry';
+import { cache, CacheTTL, generateCacheKey } from '@/lib/cache';
 
 /**
  * GET /api/dq/critical-failed-records
@@ -12,8 +16,23 @@ import { getServerConfig } from "@/lib/server-config";
  * Falls back to most recent date if no data for today
  */
 export async function GET(request: NextRequest) {
+  const startTime = Date.now();
+  const endpoint = '/api/dq/critical-failed-records';
+
   try {
-    // Get config from server-side storage
+    logger.logApiRequest(endpoint, 'GET');
+
+    const cacheKey = generateCacheKey(endpoint);
+    const cachedData = cache.get(cacheKey);
+    if (cachedData) {
+      logger.logApiResponse(endpoint, true, Date.now() - startTime);
+      return NextResponse.json({
+        success: true,
+        data: cachedData,
+        metadata: { cached: true, timestamp: new Date().toISOString() },
+      });
+    }
+
     const config = getServerConfig();
     if (!config) {
       return NextResponse.json(
@@ -70,20 +89,17 @@ export async function GET(request: NextRequest) {
       }
     }
 
+    const result = { criticalFailedRecords: criticalFailedRecords || 0 };
+    cache.set(cacheKey, result, CacheTTL.QUICK_METRICS);
+    logger.logApiResponse(endpoint, true, Date.now() - startTime);
+
     return NextResponse.json({
       success: true,
-      data: {
-        criticalFailedRecords: criticalFailedRecords || 0,
-      },
+      data: result,
+      metadata: { cached: false, timestamp: new Date().toISOString() },
     });
   } catch (error: any) {
-    console.error("Error fetching critical failed records:", error);
-    return NextResponse.json(
-      {
-        success: false,
-        error: error.message || "Failed to fetch critical failed records",
-      },
-      { status: 500 }
-    );
+    logger.error("Error fetching critical failed records", error, { endpoint });
+    return NextResponse.json(createErrorResponse(error), { status: 500 });
   }
 }

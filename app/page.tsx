@@ -122,307 +122,102 @@ export default function Home() {
     checkConnection();
   }, [snowflakeConfig, setIsConnected]);
 
-  // Fetch data quality score when connected
+  // Fetch all KPI data in parallel when connected - OPTIMIZED for speed
   useEffect(() => {
     if (!isConnected) {
+      // Reset all values when disconnected
       setDqScore(0);
       setScoreDiff(undefined);
+      setTotalChecks(0);
+      setTotalFailedChecks(0);
+      setFailedChecksDiff(undefined);
+      setSlaCompliancePct(0);
+      setCriticalFailedRecords(0);
       return;
     }
 
-    const fetchDQScore = async () => {
+    const fetchAllKPIs = async () => {
+      // Set all loading states
       setIsLoadingScore(true);
+      setIsLoadingChecks(true);
+      setIsLoadingFailedChecks(true);
+      setIsLoadingSlaCompliance(true);
+      setIsLoadingCriticalFailedRecords(true);
+
       try {
-        const response = await fetch("/api/dq/overall-score");
-        const data = await response.json();
+        // Fetch all APIs in parallel for maximum speed
+        const [scoreRes, checksRes, failedRes, slaRes, criticalRes] = await Promise.all([
+          fetch("/api/dq/overall-score"),
+          fetch("/api/dq/total-checks"),
+          fetch("/api/dq/failed-checks"),
+          fetch("/api/dq/sla-compliance"),
+          fetch("/api/dq/critical-failed-records"),
+        ]);
 
-        if (data.success && data.data) {
-          const overallScore = data.data.overallScore;
-          const scoreDifference = data.data.scoreDifference;
-          const previousScore = data.data.previousScore;
+        // Parse all responses in parallel
+        const [scoreData, checksData, failedData, slaData, criticalData] = await Promise.all([
+          scoreRes.json(),
+          checksRes.json(),
+          failedRes.json(),
+          slaRes.json(),
+          criticalRes.json(),
+        ]);
 
+        // Update DQ Score
+        if (scoreData.success && scoreData.data) {
+          const overallScore = scoreData.data.overallScore;
           if (overallScore !== null && overallScore !== undefined) {
-            // DQ_SCORE might be 0-100 or 0-1, normalize to 0-100
             let currentScore = overallScore;
             if (currentScore > 0 && currentScore <= 1) {
               currentScore = currentScore * 100;
             }
             setDqScore(Math.round(currentScore));
 
-            // Set score difference if available, otherwise use static value
+            const scoreDifference = scoreData.data.scoreDifference;
+            const previousScore = scoreData.data.previousScore;
             if (scoreDifference !== null && scoreDifference !== undefined) {
-              setScoreDiff(Math.round(scoreDifference * 10) / 10); // One decimal place
+              setScoreDiff(Math.round(scoreDifference * 10) / 10);
             } else if (previousScore === null) {
-              // Use static previous score of 75 when previousScore is null
               const staticPreviousScore = 75;
               const diff = currentScore - staticPreviousScore;
-              setScoreDiff(Math.round(diff * 10) / 10); // One decimal place
+              setScoreDiff(Math.round(diff * 10) / 10);
             }
-          } else {
-            setDqScore(0);
-            setScoreDiff(undefined);
           }
         }
+
+        // Update Total Checks
+        if (checksData.success && checksData.data) {
+          setTotalChecks(checksData.data.totalChecks || 0);
+        }
+
+        // Update Failed Checks
+        if (failedData.success && failedData.data) {
+          setTotalFailedChecks(failedData.data.totalFailedChecks || 0);
+          setFailedChecksDiff(failedData.data.failedChecksDifference);
+        }
+
+        // Update SLA Compliance
+        if (slaData.success && slaData.data) {
+          setSlaCompliancePct(slaData.data.slaCompliancePct || 0);
+        }
+
+        // Update Critical Failed Records
+        if (criticalData.success && criticalData.data) {
+          setCriticalFailedRecords(criticalData.data.criticalFailedRecords || 0);
+        }
       } catch (error) {
-        console.error("Error fetching DQ score:", error);
-        setDqScore(0);
-        setScoreDiff(undefined);
+        console.error("Error fetching KPIs:", error);
       } finally {
+        // Clear all loading states
         setIsLoadingScore(false);
-      }
-    };
-
-    fetchDQScore();
-  }, [isConnected]);
-
-  // Fetch total checks when connected
-  useEffect(() => {
-    if (!isConnected) {
-      setTotalChecks(0);
-      return;
-    }
-
-    const fetchTotalChecks = async () => {
-      setIsLoadingChecks(true);
-      try {
-        const response = await fetch("/api/dq/total-checks");
-        const data = await response.json();
-
-        if (data.success && data.data) {
-          setTotalChecks(data.data.totalChecks || 0);
-        }
-      } catch (error) {
-        console.error("Error fetching total checks:", error);
-        setTotalChecks(0);
-      } finally {
         setIsLoadingChecks(false);
-      }
-    };
-
-    fetchTotalChecks();
-  }, [isConnected]);
-
-  // Fetch failed checks when connected
-  useEffect(() => {
-    if (!isConnected) {
-      setTotalFailedChecks(0);
-      return;
-    }
-
-    const fetchFailedChecks = async () => {
-      setIsLoadingFailedChecks(true);
-      try {
-        const response = await fetch("/api/dq/failed-checks");
-        const data = await response.json();
-
-        if (data.success && data.data) {
-          setTotalFailedChecks(data.data.totalFailedChecks || 0);
-          setFailedChecksDiff(data.data.failedChecksDifference);
-        }
-      } catch (error) {
-        console.error("Error fetching failed checks:", error);
-        setTotalFailedChecks(0);
-        setFailedChecksDiff(undefined);
-      } finally {
         setIsLoadingFailedChecks(false);
-      }
-    };
-
-    fetchFailedChecks();
-  }, [isConnected]);
-
-  // Fetch SLA compliance when connected
-  useEffect(() => {
-    if (!isConnected) {
-      setSlaCompliancePct(0);
-      return;
-    }
-
-    const fetchSlaCompliance = async () => {
-      setIsLoadingSlaCompliance(true);
-      try {
-        const response = await fetch("/api/dq/sla-compliance");
-        const data = await response.json();
-
-        if (data.success && data.data) {
-          setSlaCompliancePct(data.data.slaCompliancePct || 0);
-        }
-      } catch (error) {
-        console.error("Error fetching SLA compliance:", error);
-        setSlaCompliancePct(0);
-      } finally {
         setIsLoadingSlaCompliance(false);
-      }
-    };
-
-    fetchSlaCompliance();
-  }, [isConnected]);
-
-  // Fetch data trust level when connected
-  useEffect(() => {
-    if (!isConnected) {
-      setTrustLevel("Unknown");
-      return;
-    }
-
-    const fetchTrustLevel = async () => {
-      setIsLoadingTrustLevel(true);
-      try {
-        const response = await fetch("/api/dq/data-trust-level");
-        const data = await response.json();
-
-        if (data.success && data.data) {
-          setTrustLevel(data.data.trustLevel || "Unknown");
-        }
-      } catch (error) {
-        console.error("Error fetching data trust level:", error);
-        setTrustLevel("Unknown");
-      } finally {
-        setIsLoadingTrustLevel(false);
-      }
-    };
-
-    fetchTrustLevel();
-  }, [isConnected]);
-
-  // Fetch critical failed records when connected
-  useEffect(() => {
-    if (!isConnected) {
-      setCriticalFailedRecords(0);
-      return;
-    }
-
-    const fetchCriticalFailedRecords = async () => {
-      setIsLoadingCriticalFailedRecords(true);
-      try {
-        const response = await fetch("/api/dq/critical-failed-records");
-        const data = await response.json();
-
-        if (data.success && data.data) {
-          setCriticalFailedRecords(data.data.criticalFailedRecords || 0);
-        }
-      } catch (error) {
-        console.error("Error fetching critical failed records:", error);
-        setCriticalFailedRecords(0);
-      } finally {
         setIsLoadingCriticalFailedRecords(false);
       }
     };
 
-    fetchCriticalFailedRecords();
-  }, [isConnected]);
-
-  // Fetch score by dataset when connected
-  useEffect(() => {
-    if (!isConnected) {
-      setScoreByDatasetData([]);
-      return;
-    }
-
-    const fetchScoreByDataset = async () => {
-      setIsLoadingScoreByDataset(true);
-      try {
-        const response = await fetch("/api/dq/score-by-dataset");
-        const data = await response.json();
-
-        if (data.success && data.data) {
-          setScoreByDatasetData(data.data.datasets || []);
-        }
-      } catch (error) {
-        console.error("Error fetching score by dataset:", error);
-        setScoreByDatasetData([]);
-      } finally {
-        setIsLoadingScoreByDataset(false);
-      }
-    };
-
-    fetchScoreByDataset();
-  }, [isConnected]);
-
-  // Fetch failures by rule type when connected
-  useEffect(() => {
-    if (!isConnected) {
-      setRuleTypeData([]);
-      return;
-    }
-
-    const fetchRuleTypeData = async () => {
-      setIsLoadingRuleTypeData(true);
-      try {
-        const response = await fetch("/api/dq/failures-by-rule-type");
-        const data = await response.json();
-
-        if (data.success && data.data) {
-          setRuleTypeData(data.data.ruleTypes || []);
-        }
-      } catch (error) {
-        console.error("Error fetching failures by rule type:", error);
-        setRuleTypeData([]);
-      } finally {
-        setIsLoadingRuleTypeData(false);
-      }
-    };
-
-    fetchRuleTypeData();
-  }, [isConnected]);
-
-  // Fetch SLA compliance data when connected
-  useEffect(() => {
-    if (!isConnected) {
-      setSlaComplianceData([]);
-      return;
-    }
-
-    const fetchSlaComplianceData = async () => {
-      setIsLoadingSlaComplianceData(true);
-      try {
-        const response = await fetch("/api/dq/sla-compliance-monitor");
-        const data = await response.json();
-
-        if (data.success && data.data) {
-          setSlaComplianceData(data.data.slaCompliance || []);
-        }
-      } catch (error) {
-        console.error("Error fetching SLA compliance data:", error);
-        setSlaComplianceData([]);
-      } finally {
-        setIsLoadingSlaComplianceData(false);
-      }
-    };
-
-    fetchSlaComplianceData();
-  }, [isConnected]);
-
-  // Fetch DQ score trend data when connected
-  useEffect(() => {
-    if (!isConnected) {
-      setDqScoreTrendData([]);
-      return;
-    }
-
-    const fetchDqScoreTrend = async () => {
-      setIsLoadingDqScoreTrend(true);
-      try {
-        const response = await fetch("/api/dq/daily-summary");
-        const data = await response.json();
-
-        if (data.success && data.data) {
-          // Format the data for the chart
-          const formattedData = data.data.map((row: any) => ({
-            date: row.SUMMARY_DATE,
-            dq_score: row.DQ_SCORE,
-          }));
-          setDqScoreTrendData(formattedData);
-        }
-      } catch (error) {
-        console.error("Error fetching DQ score trend:", error);
-        setDqScoreTrendData([]);
-      } finally {
-        setIsLoadingDqScoreTrend(false);
-      }
-    };
-
-    fetchDqScoreTrend();
+    fetchAllKPIs();
   }, [isConnected]);
 
   return (
@@ -594,10 +389,9 @@ export default function Home() {
                             <tr key={i} className="border-b border-slate-100 last:border-0 hover:bg-slate-50 transition-colors">
                               <td className="px-6 py-3 text-slate-600 font-mono">{row.date}</td>
                               <td className="px-6 py-3">
-                                <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold ${
-                                  row.dq_score >= 90 ? 'bg-emerald-100 text-emerald-800' : 
+                                <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-bold ${row.dq_score >= 90 ? 'bg-emerald-100 text-emerald-800' :
                                   row.dq_score >= 75 ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800'
-                                }`}>
+                                  }`}>
                                   {row.dq_score}
                                 </span>
                               </td>
@@ -687,10 +481,10 @@ export default function Home() {
                                 entry.score >= 90
                                   ? "#10b981"
                                   : entry.score >= 80
-                                  ? "#f59e0b"
-                                  : entry.score >= 70
-                                  ? "#f97316"
-                                  : "#ef4444"
+                                    ? "#f59e0b"
+                                    : entry.score >= 70
+                                      ? "#f97316"
+                                      : "#ef4444"
                               }
                             />
                           ))}
@@ -784,11 +578,10 @@ export default function Home() {
                             </td>
                             <td className="px-4 py-3">
                               <span
-                                className={`px-2 py-1 rounded-full text-xs font-semibold ${
-                                  row.status === "Met"
-                                    ? "bg-emerald-100 text-emerald-700"
-                                    : "bg-rose-100 text-rose-700"
-                                }`}
+                                className={`px-2 py-1 rounded-full text-xs font-semibold ${row.status === "Met"
+                                  ? "bg-emerald-100 text-emerald-700"
+                                  : "bg-rose-100 text-rose-700"
+                                  }`}
                               >
                                 {row.status}
                               </span>

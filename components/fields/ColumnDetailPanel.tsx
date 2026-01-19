@@ -7,7 +7,7 @@ import { ColumnCheckResults } from './sections/ColumnCheckResults';
 import { ColumnAnomaliesDrift } from './sections/ColumnAnomaliesDrift';
 import { RunCheckDialog } from './RunCheckDialog';
 import { Button } from '@/components/ui/button';
-import { ExternalLink } from 'lucide-react';
+import { ExternalLink, BarChart3 } from 'lucide-react';
 
 interface ColumnDetailPanelProps {
     database: string;
@@ -173,6 +173,9 @@ export function ColumnDetailPanel({ database, schema, table, column }: ColumnDet
         );
     }
 
+    // Check if profiling is needed
+    const needsProfiling = (details as any).needsProfiling === true;
+
     return (
         <div className="flex-1 overflow-y-auto h-full p-8 bg-white">
             <div className="flex items-center justify-between mb-8">
@@ -185,13 +188,55 @@ export function ColumnDetailPanel({ database, schema, table, column }: ColumnDet
                 </Button>
             </div>
 
-            <div className="space-y-8">
-                <ColumnOverview metadata={details.metadata} stats={details.currentStats} />
+            {needsProfiling ? (
+                <div className="flex flex-col items-center justify-center py-16 px-8 bg-slate-50 rounded-lg border-2 border-dashed border-slate-200">
+                    <div className="w-16 h-16 bg-indigo-100 rounded-full flex items-center justify-center mb-4">
+                        <BarChart3 className="w-8 h-8 text-indigo-600" />
+                    </div>
+                    <h3 className="text-lg font-semibold text-slate-900 mb-2">No Profiling Data Available</h3>
+                    <p className="text-slate-600 text-center max-w-md mb-6">
+                        This column hasn't been profiled yet. Run profiling to view detailed statistics, completeness metrics, and historical trends.
+                    </p>
+                    <div className="flex gap-3">
+                        <Button
+                            variant="default"
+                            onClick={() => {
+                                // Navigate to Overview tab to run profiling
+                                window.location.hash = 'overview';
+                            }}
+                            className="bg-indigo-600 hover:bg-indigo-700">
+                            Go to Overview to Run Profiling
+                        </Button>
+                    </div>
 
-                <ColumnStatistics history={details.history} stats={details.currentStats} />
+                    {/* Show basic metadata */}
+                    <div className="mt-8 w-full max-w-md">
+                        <h4 className="text-sm font-semibold text-slate-700 mb-3">Basic Column Information</h4>
+                        <div className="bg-white rounded-lg border border-slate-200 p-4 space-y-2">
+                            <div className="flex justify-between">
+                                <span className="text-sm text-slate-500">Column Name:</span>
+                                <span className="text-sm font-medium text-slate-900">{details.metadata.columnName}</span>
+                            </div>
+                            <div className="flex justify-between">
+                                <span className="text-sm text-slate-500">Data Type:</span>
+                                <span className="text-sm font-mono font-medium text-slate-900">{details.metadata.dataType}</span>
+                            </div>
+                            <div className="flex justify-between">
+                                <span className="text-sm text-slate-500">Nullable:</span>
+                                <span className="text-sm font-medium text-slate-900">{details.metadata.isNullable ? 'Yes' : 'No'}</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            ) : (
+                <div className="space-y-8">
+                    <ColumnOverview metadata={details.metadata} stats={details.currentStats} />
 
-                <ColumnAnomaliesDrift events={events} />
-            </div>
+                    <ColumnStatistics history={details.history} stats={details.currentStats} />
+
+                    <ColumnAnomaliesDrift events={events} />
+                </div>
+            )}
 
             <RunCheckDialog
                 isOpen={isRunCheckOpen}

@@ -195,7 +195,8 @@ export async function POST(request: NextRequest) {
                 LAST_RUN_AT TIMESTAMP_TZ,
                 CREATED_BY VARCHAR(255),
                 CREATED_AT TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),
-                UPDATED_AT TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP()
+                UPDATED_AT TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),
+                CUSTOM_CONFIG VARCHAR(16777216) -- Store JSON config for custom rules/scope
             )
         `;
 
@@ -208,25 +209,64 @@ export async function POST(request: NextRequest) {
         // Calculate next run time based on schedule time and timezone
         // Calculate the date in TypeScript for reliability
         let nextRunAt = "CURRENT_TIMESTAMP()";
-        if (scheduleTime) {
-            // Parse schedule time
-            const [hours, minutes] = scheduleTime.split(":").map(Number);
-            const now = new Date();
 
-            // Create a date for today at the scheduled time
-            const scheduledToday = new Date();
-            scheduledToday.setHours(hours, minutes, 0, 0);
-
-            // If the scheduled time has passed today, schedule for tomorrow
-            let targetDate = scheduledToday;
-            if (scheduledToday <= now) {
-                targetDate = new Date(scheduledToday.getTime() + 24 * 60 * 60 * 1000); // tomorrow
-            }
-
-            // Format as ISO string for Snowflake
-            const isoDate = targetDate.toISOString().slice(0, 16).replace("T", " ");
-            nextRunAt = `TO_TIMESTAMP_TZ('${isoDate}', 'YYYY-MM-DD HH24:MI')`;
+        // Priority: Use the client-calculated UTC timestamp if provided (Most Robust)
+        if (body.initialNextRunAt) {
+            console.log("[DEBUG-SCHEDULE-CLIENT] Using Client-Provided UTC:", body.initialNextRunAt);
+            // body.initialNextRunAt is ISO string e.g. "2026-01-19T11:55:00.000Z"
+            // Use TO_TIMESTAMP_TZ with ISO format
+            nextRunAt = `TO_TIMESTAMP_TZ('${body.initialNextRunAt}', 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"')`;
         }
+        else if (scheduleTime) {
+            // Fallback: Server-side calculation (proven less reliable due to locale)
+            // ... (keep existing logic as fallback)
+
+            const [hours, minutes] = scheduleTime.split(":").map(Number);
+            const userTz = timezone || "UTC";
+
+            // ... existing fallback code ...
+            // For brevity in this replace block, I will simplify the fallback to just log a warning
+            // But actually, let's keep the CONVERT_TIMEZONE logic just in case old clients call this.
+
+            // 1. Get "Today" date in User's Timezone
+            const now = new Date();
+            const userNowStr = now.toLocaleString("sv-SE", { timeZone: userTz });
+            const [datePart, timePart] = userNowStr.split(" ");
+            const [year, month, day] = datePart.split("-").map(Number);
+            const [curH, curM, curS] = timePart.split(":").map(Number);
+
+            let targetYear = year;
+            let targetMonth = month;
+            let targetDay = day;
+            const isPassed = (hours < curH) || (hours === curH && minutes <= curM);
+
+            if (isPassed) {
+                const d = new Date(year, month - 1, day);
+                d.setDate(d.getDate() + 1);
+                targetYear = d.getFullYear();
+                targetMonth = d.getMonth() + 1;
+                targetDay = d.getDate();
+            }
+            const pad = (n: number) => n.toString().padStart(2, '0');
+            const targetLocalString = `${targetYear}-${pad(targetMonth)}-${pad(targetDay)} ${pad(hours)}:${pad(minutes)}:00`;
+
+            console.log("[DEBUG-SCHEDULE-FINAL] User TZ:", userTz);
+            console.log("[DEBUG-SCHEDULE-FINAL] Target Local String:", targetLocalString);
+
+            // SQL Expression:
+            // Convert Local Time (NTZ) to UTC using Snowflake's timezone database.
+            // Then explicit cast to TIMESTAMP_TZ with +00:00 offset to guarantee it's stored as UTC.
+            // Note: We use ::TIMESTAMP_NTZ to tell Snowflake the input string is just a wall-clock time.
+
+            nextRunAt = `TO_TIMESTAMP_TZ(TO_VARCHAR(CONVERT_TIMEZONE('${userTz}', 'UTC', '${targetLocalString}'::TIMESTAMP_NTZ), 'YYYY-MM-DD HH24:MI:SS') || ' +00:00', 'YYYY-MM-DD HH24:MI:SS TZH:TZM')`;
+        }
+
+        // Construct Custom Config JSON
+        const customConfig = {
+            customRules: body.customRules || [],
+            scope: body.scope || "table",
+            selectedColumns: body.selectedColumns || []
+        };
 
         const insertQuery = `
             INSERT INTO DATA_QUALITY_DB.DQ_CONFIG.SCAN_SCHEDULES (
@@ -234,8 +274,10 @@ export async function POST(request: NextRequest) {
                 SCAN_TYPE, IS_RECURRING, SCHEDULE_TYPE, SCHEDULE_TIME,
                 SCHEDULE_DAYS, TIMEZONE, START_DATE, END_DATE,
                 SKIP_IF_RUNNING, ON_FAILURE_ACTION, MAX_FAILURES,
-                NOTIFY_ON_FAILURE, NOTIFY_ON_SUCCESS, STATUS, NEXT_RUN_AT
-            ) VALUES (
+                NOTIFY_ON_FAILURE, NOTIFY_ON_SUCCESS, STATUS, NEXT_RUN_AT,
+                CUSTOM_CONFIG
+            )
+            SELECT
                 '${scheduleId}',
                 '${database.toUpperCase()}',
                 '${schema.toUpperCase()}',
@@ -254,8 +296,8 @@ export async function POST(request: NextRequest) {
                 ${notifyOnFailure ?? false},
                 ${notifyOnSuccess ?? false},
                 'active',
-                ${nextRunAt}
-            )
+                ${nextRunAt},
+                '${JSON.stringify(customConfig)}'
         `;
 
         // Try insert, if schema error (invalid identifier), drop and recreate table

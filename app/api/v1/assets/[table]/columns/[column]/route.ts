@@ -100,10 +100,72 @@ export async function GET(
         ]);
 
         if (metadataRows.length === 0) {
-            console.log(`[API Details] Column not found in DQ_COLUMN_PROFILE`);
-            // Try to fetch from INFORMATION_SCHEMA as fallback? 
-            // For now just error
-            return NextResponse.json({ success: false, error: 'Column not found' }, { status: 404 });
+            console.log(`[API Details] Column not found in DQ_COLUMN_PROFILE, trying INFORMATION_SCHEMA fallback`);
+
+            // Fallback: Fetch from INFORMATION_SCHEMA
+            try {
+                const fallbackSql = `
+                    SELECT 
+                        COLUMN_NAME,
+                        DATA_TYPE,
+                        IS_NULLABLE
+                    FROM ${database}.INFORMATION_SCHEMA.COLUMNS
+                    WHERE UPPER(TABLE_NAME) = ?
+                      AND UPPER(TABLE_SCHEMA) = ?
+                      AND UPPER(COLUMN_NAME) = ?
+                `;
+
+                const fallbackRows = await new Promise<any[]>((resolve, reject) => {
+                    conn.execute({
+                        sqlText: fallbackSql,
+                        binds: [table.toUpperCase(), schema.toUpperCase(), column.toUpperCase()],
+                        complete: (err: any, _stmt: any, rows: any) => {
+                            if (err) reject(err); else resolve(rows || []);
+                        }
+                    });
+                });
+
+                if (fallbackRows.length === 0) {
+                    return NextResponse.json({
+                        success: false,
+                        error: 'Column not found in database. Please verify the column name.'
+                    }, { status: 404 });
+                }
+
+                const fallbackMeta = fallbackRows[0];
+                console.log(`[API Details] Found column in INFORMATION_SCHEMA:`, fallbackMeta);
+
+                // Return minimal metadata without profiling stats
+                return NextResponse.json({
+                    success: true,
+                    data: {
+                        metadata: {
+                            columnName: fallbackMeta.COLUMN_NAME,
+                            dataType: fallbackMeta.DATA_TYPE,
+                            isNullable: fallbackMeta.IS_NULLABLE === 'YES',
+                            rowCount: null,
+                            lastUpdated: null
+                        },
+                        currentStats: {
+                            distinctCount: null,
+                            nullCount: null,
+                            rowCount: null,
+                            min: null,
+                            max: null,
+                            avg: null,
+                            stdDev: null
+                        },
+                        history: [],
+                        needsProfiling: true // Flag to indicate profiling is needed
+                    }
+                });
+            } catch (fallbackError: any) {
+                console.error('[API Details] Fallback query failed:', fallbackError);
+                return NextResponse.json({
+                    success: false,
+                    error: 'Column not found. Please run profiling first.'
+                }, { status: 404 });
+            }
         }
 
         const meta = metadataRows[0];

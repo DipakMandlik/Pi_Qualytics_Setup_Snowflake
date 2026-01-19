@@ -7,7 +7,7 @@ import {
   Activity, FileText, Eye, RefreshCw, Download, PlayCircle,
   ArrowLeft, CheckCircle2, AlertOctagon, MoreVertical, X, Loader2,
   BarChart2, AlertTriangle, Hash, Calendar, Type, Clock,
-  Plus, CheckCircle, Play, Pause, Trash2
+  Plus, CheckCircle, Play, Pause, Trash2, ArrowRight
 } from "lucide-react";
 import { FieldsTab } from '@/components/fields/FieldsTab';
 import {
@@ -49,6 +49,18 @@ export default function TableDetailsPage() {
   const router = useRouter();
   const dataset = decodeURIComponent(params.dataset as string);
   const tableName = decodeURIComponent(params.table as string);
+
+  // Helper to format Snowflake UTC timestamps to Local Time
+  const formatUtcToLocal = (timestamp: string | null | undefined) => {
+    if (!timestamp) return "-";
+    // If timestamp doesn't end with Z and doesn't have offset, assume it implies UTC and append Z
+    const timeStr = timestamp.endsWith("Z") || timestamp.includes("+") ? timestamp : timestamp + "Z";
+    try {
+      return new Date(timeStr).toLocaleString();
+    } catch (e) {
+      return timestamp;
+    }
+  };
 
   const [activeTab, setActiveTab] = useState("overview");
   const [previewData, setPreviewData] = useState<{
@@ -115,7 +127,7 @@ export default function TableDetailsPage() {
   const [resultsModalData, setResultsModalData] = useState<{ summary: any; checks: any[] } | null>(null);
   const [isLoadingResults, setIsLoadingResults] = useState(false);
   const [isRerunning, setIsRerunning] = useState<string | null>(null);
-  // Profiling state removed
+  const [isRunningProfile, setIsRunningProfile] = useState(false);
   const { showToast } = useToast();
 
   // Observability state
@@ -275,6 +287,10 @@ export default function TableDetailsPage() {
     maxFailures: 3,
     notifyOnFailure: false,
     notifyOnSuccess: false,
+    // Step 1.5: Custom Rule Selection
+    customRules: [] as string[],
+    scope: "table" as "table" | "columns",
+    selectedColumns: [] as string[],
   });
 
   const groupedRules = useMemo(() => {
@@ -290,39 +306,9 @@ export default function TableDetailsPage() {
   // Extract schema from dataset (format: "DATABASE.SCHEMA")
   const [databaseName, schemaName] = dataset.split(".");
 
-  // Mock data for quality score history chart (will be replaced with actual data)
-  const mockQualityScoreHistory = [
-    { date: "2025-12-08", dq_score: 82 },
-    { date: "2025-12-09", dq_score: 85 },
-    { date: "2025-12-10", dq_score: 78 },
-    { date: "2025-12-11", dq_score: 81 },
-    { date: "2025-12-12", dq_score: 88 },
-    { date: "2025-12-13", dq_score: 92 },
-    { date: "2025-12-14", dq_score: 87 },
-    { date: "2025-12-15", dq_score: 84 },
-    { date: "2025-12-16", dq_score: 89 },
-    { date: "2025-12-17", dq_score: 93 },
-    { date: "2025-12-18", dq_score: 90 },
-    { date: "2025-12-19", dq_score: 86 },
-    { date: "2025-12-20", dq_score: 91 },
-    { date: "2025-12-21", dq_score: 95 },
-    { date: "2025-12-22", dq_score: 88 },
-    { date: "2025-12-23", dq_score: 92 },
-    { date: "2025-12-24", dq_score: 96 },
-    { date: "2025-12-25", dq_score: 89 },
-    { date: "2025-12-26", dq_score: 94 },
-    { date: "2025-12-27", dq_score: 91 },
-    { date: "2025-12-28", dq_score: 87 },
-    { date: "2025-12-29", dq_score: 93 },
-    { date: "2025-12-30", dq_score: 97 },
-    { date: "2025-12-31", dq_score: 94 },
-    { date: "2026-01-01", dq_score: 90 },
-    { date: "2026-01-02", dq_score: 95 },
-    { date: "2026-01-03", dq_score: 92 },
-    { date: "2026-01-04", dq_score: 88 },
-    { date: "2026-01-05", dq_score: 96 },
-    { date: "2026-01-06", dq_score: 93 },
-  ];
+  // Quality score history state - fetched from Snowflake
+  const [qualityScoreHistory, setQualityScoreHistory] = useState<Array<{ date: string; dq_score: number }>>([]);
+  const [isLoadingQualityHistory, setIsLoadingQualityHistory] = useState(false);
 
   // Fetch table preview data when Data Preview tab is active
   useEffect(() => {
@@ -346,31 +332,31 @@ export default function TableDetailsPage() {
     }
   }, [activeTab]);
 
-  // Auto-poll scheduler every 60 seconds when Activity tab is active
-  // This checks for due schedules and executes them - zero Snowflake credit cost
+  // Ensure rules/columns are loaded when Schedule Modal Step 1 involves Custom/Columns
+  useEffect(() => {
+    if (showScheduleModal) {
+      if ((newSchedule.scanType === "custom" || newSchedule.scanType === "checks") && rules.length === 0) {
+        fetchRuleConfiguration();
+      }
+      if (newSchedule.scope === "columns" && availableColumns.length === 0) {
+        fetchRuleConfiguration();
+      }
+    }
+  }, [showScheduleModal, newSchedule.scanType, newSchedule.scope]);
+
+
+  // Poll for updates (Activity & Schedules) every 30 seconds
+  // Note: Actual execution is now handled safely by Snowflake Backend (DQ_DAILY_SCAN_TASK)
+  // We only poll to refresh the UI with the latest runs
   useEffect(() => {
     if (activeTab !== "activity") return;
 
-    const checkScheduler = async () => {
-      try {
-        const response = await fetch("/api/scheduler/run");
-        const result = await response.json();
-        if (result.success && result.data?.executed > 0) {
-          console.log(`Scheduler executed ${result.data.executed} due scans`);
-          // Refresh activity and schedules data
-          fetchActivity();
-          fetchSchedules();
-        }
-      } catch (e: any) {
-        console.log("Scheduler check:", e.message);
-      }
+    const pollUpdates = () => {
+      fetchActivity();
+      fetchSchedules();
     };
 
-    // Check immediately when switching to Activity tab
-    checkScheduler();
-
-    // Then check every 60 seconds
-    const interval = setInterval(checkScheduler, 60000);
+    const interval = setInterval(pollUpdates, 30000);
     return () => clearInterval(interval);
   }, [activeTab]);
 
@@ -378,7 +364,36 @@ export default function TableDetailsPage() {
   useEffect(() => {
     fetchTableRowCount();
     fetchQualityScore();
+    fetchQualityScoreHistory();
+    fetchObservabilityData(); // Fetch this on mount to get Freshness for Overview
   }, []);
+
+  // Fetch observability data when Observability tab is activated
+  // (Optional: can keep this to refresh when tab is clicked, or remove if mount is enough)
+  useEffect(() => {
+    if (activeTab === "observability") {
+      fetchObservabilityData();
+    }
+  }, [activeTab]);
+
+  const fetchQualityScoreHistory = async () => {
+    try {
+      setIsLoadingQualityHistory(true);
+      const response = await fetch(
+        `/api/dq/quality-score-history?database=${encodeURIComponent(databaseName)}&schema=${encodeURIComponent(schemaName)}&table=${encodeURIComponent(tableName)}&days=30`
+      );
+      const result = await response.json();
+
+      if (result.success && result.data) {
+        setQualityScoreHistory(result.data.history || []);
+      }
+    } catch (error: any) {
+      console.error("Error fetching quality score history:", error);
+      setQualityScoreHistory([]);
+    } finally {
+      setIsLoadingQualityHistory(false);
+    }
+  };
 
   const fetchTableRowCount = async () => {
     try {
@@ -433,6 +448,89 @@ export default function TableDetailsPage() {
       console.error("Error fetching quality score:", error);
     } finally {
       setIsLoadingQualityScore(false);
+    }
+  };
+
+  const fetchObservabilityData = async () => {
+    try {
+      setIsLoadingObservability(true);
+      setObservabilityError(null);
+
+      // Fetch table metadata
+      const metadataRes = await fetch(
+        `/api/snowflake/table-metadata?database=${encodeURIComponent(databaseName)}&schema=${encodeURIComponent(schemaName)}&table=${encodeURIComponent(tableName)}`
+      );
+      const metadataData = await metadataRes.json();
+
+      if (metadataData.success && metadataData.data) {
+        // Set Volume data
+        setObservabilityVolume({
+          rowCount: metadataData.data.rowCount,
+          bytes: metadataData.data.bytes,
+          bytesFormatted: metadataData.data.bytesFormatted,
+        });
+
+        // Set Schema data
+        setObservabilitySchema({
+          columnCount: metadataData.data.columnCount,
+          nullableColumnCount: metadataData.data.nullableColumnCount,
+        });
+      }
+
+      // Fetch freshness data
+      const freshnessRes = await fetch(
+        `/api/snowflake/table-freshness?database=${encodeURIComponent(databaseName)}&schema=${encodeURIComponent(schemaName)}&table=${encodeURIComponent(tableName)}`
+      );
+      const freshnessData = await freshnessRes.json();
+
+      if (freshnessData.success && freshnessData.data) {
+        setObservabilityFreshness({
+          lastUpdated: freshnessData.data.lastUpdated,
+          slaStatus: freshnessData.data.slaStatus,
+          freshnessDelayFormatted: freshnessData.data.freshnessDelayFormatted,
+          createdFormatted: freshnessData.data.createdFormatted,
+        });
+      }
+
+      // Fetch health score
+      const healthRes = await fetch(
+        `/api/snowflake/table-health-score?database=${encodeURIComponent(databaseName)}&schema=${encodeURIComponent(schemaName)}&table=${encodeURIComponent(tableName)}`
+      );
+      const healthData = await healthRes.json();
+
+      if (healthData.success && healthData.data) {
+        setObservabilityHealthScore({
+          overallScore: healthData.data.overallScore,
+          freshnessScore: healthData.data.freshnessScore,
+          volumeScore: healthData.data.volumeScore,
+          schemaScore: healthData.data.schemaScore,
+        });
+      }
+
+      // Set load reliability (placeholder for now)
+      setObservabilityLoads({
+        loadHistoryAvailable: false,
+      });
+
+      // Fetch lineage data
+      const lineageRes = await fetch(
+        `/api/snowflake/table-lineage?database=${encodeURIComponent(databaseName)}&schema=${encodeURIComponent(schemaName)}&table=${encodeURIComponent(tableName)}`
+      );
+      const lineageData = await lineageRes.json();
+
+      if (lineageData.success && lineageData.data) {
+        setObservabilityLineage(lineageData.data);
+      } else {
+        // Fallback or empty state if fails
+        setObservabilityLineage(null);
+      }
+    } catch (error: any) {
+      console.error("Error fetching observability data:", error);
+      setObservabilityError(
+        error.message || "Failed to load observability metrics"
+      );
+    } finally {
+      setIsLoadingObservability(false);
     }
   };
 
@@ -530,6 +628,19 @@ export default function TableDetailsPage() {
     }
   };
 
+  const fetchProfileData = async () => {
+    // This is a placeholder for fetching profile data if needed by other components
+    // For now, it mainly triggers a refresh of other data sources since profiling 
+    // updates statistics that other tabs might use.
+    console.log("Fetching profile data...");
+
+    // Refresh basic table stats since profile might update row counts
+    await fetchTableRowCount();
+
+    // If the Fields tab is active, we might want to signal it to refresh, 
+    // but typically it fetches its own data when a column is selected.
+  };
+
   const fetchAnomaliesData = async () => {
     try {
       setIsLoadingAnomalies(true);
@@ -572,14 +683,31 @@ export default function TableDetailsPage() {
 
   const createSchedule = async () => {
     try {
+      // Calculate initial next run time client-side to ensure timezone correctness
+      let initialNextRunAt = null;
+      if (newSchedule.scheduleTime) {
+        const [hours, minutes] = newSchedule.scheduleTime.split(":").map(Number);
+        const now = new Date();
+        const target = new Date(now);
+        target.setHours(hours, minutes, 0, 0);
+
+        // If target time is in the past, schedule for tomorrow
+        if (target <= now) {
+          target.setDate(target.getDate() + 1);
+        }
+        initialNextRunAt = target.toISOString();
+      }
+
       const response = await fetch("/api/schedules", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          ...newSchedule,
+          datasetId: decodeURIComponent(params.dataset as string),
           database: databaseName,
           schema: schemaName,
           table: tableName,
-          ...newSchedule,
+          initialNextRunAt // Send the calculated UTC time
         }),
       });
       const result = await response.json();
@@ -754,6 +882,37 @@ export default function TableDetailsPage() {
     console.log(`${action} action triggered for table: ${tableName}`);
   };
 
+  const fetchRuleConfiguration = async () => {
+    try {
+      // Fetch configured rules
+      const rulesRes = await fetch(
+        `/api/dq/rules?database=${encodeURIComponent(databaseName)}&schema=${encodeURIComponent(schemaName)}&table=${encodeURIComponent(tableName)}`
+      );
+      const rulesJson = await rulesRes.json();
+      if (rulesJson?.success && Array.isArray(rulesJson.data)) {
+        setRules(rulesJson.data);
+      } else {
+        setRules([]);
+      }
+
+      // Fetch actual table columns
+      const colsRes = await fetch(
+        `/api/snowflake/table-columns?database=${encodeURIComponent(databaseName)}&schema=${encodeURIComponent(schemaName)}&table=${encodeURIComponent(tableName)}`
+      );
+      const colsJson = await colsRes.json();
+      if (colsJson?.success && Array.isArray(colsJson.data)) {
+        const cols = colsJson.data.map((c: any) => c.name);
+        setAvailableColumns(cols);
+      } else {
+        setAvailableColumns([]);
+      }
+    } catch (e) {
+      console.error("Failed to load rules/columns", e);
+      setRules([]);
+      setAvailableColumns([]);
+    }
+  };
+
   const openCustomScan = async () => {
     try {
       setIsCustomScanOpen(true);
@@ -778,32 +937,11 @@ export default function TableDetailsPage() {
         showToast(`Warning: ${datasetJson?.error || "Could not resolve dataset_id"}`, "warning", 5000);
       }
 
-      // Fetch configured rules
-      const rulesRes = await fetch(
-        `/api/dq/rules?database=${encodeURIComponent(databaseName)}&schema=${encodeURIComponent(schemaName)}&table=${encodeURIComponent(tableName)}`
-      );
-      const rulesJson = await rulesRes.json();
-      if (rulesJson?.success && Array.isArray(rulesJson.data)) {
-        setRules(rulesJson.data);
-      } else {
-        setRules([]);
-      }
+      // Load Rules & Columns
+      await fetchRuleConfiguration();
 
-      // Fetch actual table columns from INFORMATION_SCHEMA
-      const colsRes = await fetch(
-        `/api/snowflake/table-columns?database=${encodeURIComponent(databaseName)}&schema=${encodeURIComponent(schemaName)}&table=${encodeURIComponent(tableName)}`
-      );
-      const colsJson = await colsRes.json();
-      if (colsJson?.success && Array.isArray(colsJson.data)) {
-        const cols = colsJson.data.map((c: any) => c.name);
-        setAvailableColumns(cols);
-      } else {
-        setAvailableColumns([]);
-      }
     } catch (e) {
-      console.error("Failed to load rules/columns", e);
-      setRules([]);
-      setAvailableColumns([]);
+      console.error("Failed to open custom scan", e);
     }
   };
 
@@ -855,6 +993,8 @@ export default function TableDetailsPage() {
                 onClick={() => {
                   setScheduleFromRun(null);
                   setShowScheduleModal(true);
+                  // Fetch rules so they are available in the modal
+                  fetchRuleConfiguration();
                 }}
               >
                 <Calendar size={16} /> Schedule Scan
@@ -877,6 +1017,15 @@ export default function TableDetailsPage() {
                       }}
                     >
                       <Activity size={16} className="text-indigo-600" /> Scan
+                    </button>
+                    <button
+                      className="flex items-center gap-2 px-2 py-2 rounded hover:bg-slate-100 text-left"
+                      onClick={() => {
+                        runProfiling();
+                        setIsRunMenuOpen(false);
+                      }}
+                    >
+                      <BarChart2 size={16} className="text-indigo-600" /> Profile
                     </button>
                   </div>
                 </PopoverContent>
@@ -1558,37 +1707,47 @@ export default function TableDetailsPage() {
               <Card className="col-span-2 p-6 shadow-sm border border-slate-200">
                 <h3 className="font-bold text-slate-800 mb-4">Quality Score History</h3>
                 <div className="h-64">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={mockQualityScoreHistory}>
-                      <CartesianGrid
-                        strokeDasharray="3 3"
-                        vertical={false}
-                        stroke="#e2e8f0"
-                      />
-                      <XAxis
-                        dataKey="date"
-                        tickFormatter={(v) => v.slice(5)}
-                        stroke="#64748b"
-                        fontSize={12}
-                      />
-                      <YAxis stroke="#64748b" fontSize={12} />
-                      <Tooltip
-                        contentStyle={{
-                          borderRadius: "8px",
-                          border: "none",
-                          boxShadow: "0 4px 6px -1px rgb(0 0 0 / 0.1)",
-                        }}
-                      />
-                      <Line
-                        type="monotone"
-                        dataKey="dq_score"
-                        stroke="#4f46e5"
-                        strokeWidth={3}
-                        dot={{ r: 3 }}
-                        activeDot={{ r: 6 }}
-                      />
-                    </LineChart>
-                  </ResponsiveContainer>
+                  {isLoadingQualityHistory ? (
+                    <div className="flex items-center justify-center h-full">
+                      <p className="text-slate-500">Loading quality score history...</p>
+                    </div>
+                  ) : qualityScoreHistory.length === 0 ? (
+                    <div className="flex items-center justify-center h-full">
+                      <p className="text-slate-500">No quality score history available</p>
+                    </div>
+                  ) : (
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart data={qualityScoreHistory}>
+                        <CartesianGrid
+                          strokeDasharray="3 3"
+                          vertical={false}
+                          stroke="#e2e8f0"
+                        />
+                        <XAxis
+                          dataKey="date"
+                          tickFormatter={(v) => v.slice(5)}
+                          stroke="#64748b"
+                          fontSize={12}
+                        />
+                        <YAxis stroke="#64748b" fontSize={12} />
+                        <Tooltip
+                          contentStyle={{
+                            borderRadius: "8px",
+                            border: "none",
+                            boxShadow: "0 4px 6px -1px rgb(0 0 0 / 0.1)",
+                          }}
+                        />
+                        <Line
+                          type="monotone"
+                          dataKey="dq_score"
+                          stroke="#4f46e5"
+                          strokeWidth={3}
+                          dot={{ r: 3 }}
+                          activeDot={{ r: 6 }}
+                        />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  )}
                 </div>
               </Card>
               <Card className="p-6 shadow-sm border border-slate-200">
@@ -1862,15 +2021,15 @@ export default function TableDetailsPage() {
                     <div>
                       <h3 className="text-lg font-semibold text-slate-800">Impact & Lineage</h3>
                       <p className="text-xs text-slate-500 mt-1">
-                        {observabilityLineage?.lineageAvailable
+                        {observabilityLineage?.impact
                           ? `${observabilityLineage.impact.upstreamCount} upstream • ${observabilityLineage.impact.downstreamCount} downstream`
-                          : "Dependency tracking not available"}
+                          : "Dependency tracking unavailable"}
                       </p>
                     </div>
                     {observabilityLineage?.node?.healthStatus && (
-                      <div className={`px-3 py-1 rounded-full text-xs font-bold ${observabilityLineage.node.healthStatus === "healthy"
+                      <div className={`px-3 py-1 rounded-full text-xs font-bold ${observabilityLineage.node.healthStatus.toLowerCase() === "healthy"
                         ? "bg-emerald-100 text-emerald-800"
-                        : observabilityLineage.node.healthStatus === "delayed"
+                        : observabilityLineage.node.healthStatus.toLowerCase() === "delayed"
                           ? "bg-amber-100 text-amber-800"
                           : "bg-rose-100 text-rose-800"
                         }`}>
@@ -1880,83 +2039,57 @@ export default function TableDetailsPage() {
                   </div>
 
                   {/* Lineage Flow Visualization */}
-                  <div className="flex items-center justify-center gap-4 py-8 bg-slate-50 rounded-lg mb-4">
+                  <div className="flex items-center justify-center gap-4 py-8 bg-slate-50 rounded-lg mb-4 overflow-x-auto">
+
                     {/* Upstream Sources */}
                     <div className="flex flex-col items-end gap-2 min-w-[140px]">
                       {observabilityLineage?.upstream && observabilityLineage.upstream.length > 0 ? (
-                        observabilityLineage.upstream.slice(0, 3).map((node, idx) => (
-                          <div
-                            key={idx}
-                            className="px-3 py-2 bg-blue-50 border border-blue-200 rounded-lg text-xs font-medium text-blue-700 max-w-[140px] truncate"
-                            title={node.name}
-                          >
-                            {node.shortName}
+                        observabilityLineage.upstream.map((up, i) => (
+                          <div key={i} className="px-4 py-2 bg-white border border-slate-200 rounded-md shadow-sm text-center min-w-[140px]">
+                            <p className="text-xs font-bold text-slate-700">{up.name}</p>
+                            <p className="text-[10px] text-slate-500">{up.schema}</p>
                           </div>
                         ))
                       ) : (
-                        <div className="px-3 py-2 bg-slate-100 border border-slate-200 rounded-lg text-xs text-slate-400">
+                        <div className="px-4 py-2 bg-slate-100 border border-slate-200 rounded-md text-slate-400 text-xs italic min-w-[140px] text-center">
                           No upstream
                         </div>
                       )}
-                      {observabilityLineage?.upstream && observabilityLineage.upstream.length > 3 && (
-                        <div className="text-xs text-slate-400">
-                          +{observabilityLineage.upstream.length - 3} more
-                        </div>
-                      )}
                     </div>
 
-                    {/* Arrow Left */}
-                    <div className="flex items-center">
-                      <div className="w-8 h-0.5 bg-slate-300"></div>
-                      <ChevronRight className="h-4 w-4 text-slate-400 -ml-1" />
+                    {/* Arrow */}
+                    <div className="text-slate-300">
+                      <ArrowRight size={24} />
                     </div>
 
-                    {/* Focus Node */}
-                    <div className={`px-4 py-3 rounded-xl border-2 text-center min-w-[160px] ${observabilityLineage?.node?.healthStatus === "healthy"
-                      ? "bg-emerald-50 border-emerald-400"
-                      : observabilityLineage?.node?.healthStatus === "delayed"
-                        ? "bg-amber-50 border-amber-400"
-                        : "bg-rose-50 border-rose-400"
-                      }`}>
-                      <div className="text-sm font-bold text-slate-800">
-                        {observabilityLineage?.node?.shortName || tableName}
-                      </div>
-                      <div className="text-xs text-slate-500 mt-1">
-                        {schemaName}
-                      </div>
+                    {/* Current Node */}
+                    <div className="px-6 py-3 bg-indigo-50 border-2 border-indigo-500 rounded-lg shadow-md text-center min-w-[160px] relative z-10">
+                      <p className="text-sm font-bold text-indigo-900">{observabilityLineage?.node?.name || tableName}</p>
+                      <p className="text-xs text-indigo-600">{observabilityLineage?.node?.shortName || schemaName}</p>
                     </div>
 
-                    {/* Arrow Right */}
-                    <div className="flex items-center">
-                      <div className="w-8 h-0.5 bg-slate-300"></div>
-                      <ChevronRight className="h-4 w-4 text-slate-400 -ml-1" />
+                    {/* Arrow */}
+                    <div className="text-slate-300">
+                      <ArrowRight size={24} />
                     </div>
 
-                    {/* Downstream Consumers */}
+                    {/* Downstream Targets */}
                     <div className="flex flex-col items-start gap-2 min-w-[140px]">
                       {observabilityLineage?.downstream && observabilityLineage.downstream.length > 0 ? (
-                        observabilityLineage.downstream.slice(0, 3).map((node, idx) => (
-                          <div
-                            key={idx}
-                            className="px-3 py-2 bg-purple-50 border border-purple-200 rounded-lg text-xs font-medium text-purple-700 max-w-[140px] truncate"
-                            title={node.name}
-                          >
-                            {node.shortName}
+                        observabilityLineage.downstream.map((down, i) => (
+                          <div key={i} className="px-4 py-2 bg-white border border-slate-200 rounded-md shadow-sm text-center min-w-[140px]">
+                            <p className="text-xs font-bold text-slate-700">{down.name}</p>
+                            <p className="text-[10px] text-slate-500">{down.schema}</p>
                           </div>
                         ))
                       ) : (
-                        <div className="px-3 py-2 bg-slate-100 border border-slate-200 rounded-lg text-xs text-slate-400">
+                        <div className="px-4 py-2 bg-slate-100 border border-slate-200 rounded-md text-slate-400 text-xs italic min-w-[140px] text-center">
                           No downstream
                         </div>
                       )}
-                      {observabilityLineage?.downstream && observabilityLineage.downstream.length > 3 && (
-                        <div className="text-xs text-slate-400">
-                          +{observabilityLineage.downstream.length - 3} more
-                        </div>
-                      )}
                     </div>
-                  </div>
 
+                  </div>
                   {/* Business Impact Summary */}
                   {observabilityLineage?.impact?.summary && (
                     <div className={`p-4 rounded-lg border ${observabilityLineage.impact.level === "high"
@@ -2003,913 +2136,923 @@ export default function TableDetailsPage() {
         )}
 
         {/* Checks Tab */}
-        {activeTab === "checks" && (
-          <div className="space-y-6">
-            {/* Loading State */}
-            {isLoadingChecks && (
-              <Card className="p-6 bg-white shadow-sm border border-slate-200">
-                <div className="flex items-center justify-center h-64">
-                  <div className="text-center">
-                    <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-500 mx-auto mb-4"></div>
-                    <p className="text-sm text-slate-500">Loading quality checks...</p>
+        {
+          activeTab === "checks" && (
+            <div className="space-y-6">
+              {/* Loading State */}
+              {isLoadingChecks && (
+                <Card className="p-6 bg-white shadow-sm border border-slate-200">
+                  <div className="flex items-center justify-center h-64">
+                    <div className="text-center">
+                      <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-500 mx-auto mb-4"></div>
+                      <p className="text-sm text-slate-500">Loading quality checks...</p>
+                    </div>
                   </div>
-                </div>
-              </Card>
-            )}
-
-            {/* Error State */}
-            {checksError && !isLoadingChecks && (
-              <Card className="p-6 bg-white shadow-sm border border-red-200">
-                <div className="flex items-center justify-center h-32 text-red-500">
-                  <div className="text-center">
-                    <AlertTriangle className="h-8 w-8 mx-auto mb-2" />
-                    <p className="text-sm">{checksError}</p>
-                    <Button
-                      variant="outline"
-                      className="mt-4"
-                      onClick={() => fetchChecksData()}
-                    >
-                      <RefreshCw className="h-4 w-4 mr-2" /> Retry
-                    </Button>
-                  </div>
-                </div>
-              </Card>
-            )}
-
-            {/* Checks Content */}
-            {!isLoadingChecks && !checksError && (
-              <>
-                {/* Summary Cards */}
-                <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
-                  {/* Total Checks */}
-                  <Card className="p-4 bg-white shadow-sm border border-slate-200">
-                    <div className="text-xs text-slate-500 uppercase font-medium mb-1">Total Checks</div>
-                    <div className="text-2xl font-bold text-slate-800">
-                      {checksData?.summary.totalChecks ?? 0}
-                    </div>
-                  </Card>
-
-                  {/* Passed Checks */}
-                  <Card className="p-4 bg-white shadow-sm border-l-4 border-l-emerald-500">
-                    <div className="text-xs text-slate-500 uppercase font-medium mb-1">Passed</div>
-                    <div className="text-2xl font-bold text-emerald-600">
-                      {checksData?.summary.passedChecks ?? 0}
-                    </div>
-                  </Card>
-
-                  {/* Failed Checks */}
-                  <Card className="p-4 bg-white shadow-sm border-l-4 border-l-rose-500">
-                    <div className="text-xs text-slate-500 uppercase font-medium mb-1">Failed</div>
-                    <div className="text-2xl font-bold text-rose-600">
-                      {checksData?.summary.failedChecks ?? 0}
-                    </div>
-                  </Card>
-
-                  {/* Warning Checks */}
-                  <Card className="p-4 bg-white shadow-sm border-l-4 border-l-amber-500">
-                    <div className="text-xs text-slate-500 uppercase font-medium mb-1">Warning</div>
-                    <div className="text-2xl font-bold text-amber-600">
-                      {checksData?.summary.warningChecks ?? 0}
-                    </div>
-                  </Card>
-
-                  {/* Last Run */}
-                  <Card className="p-4 bg-white shadow-sm border border-slate-200">
-                    <div className="text-xs text-slate-500 uppercase font-medium mb-1">Last Run</div>
-                    <div className="text-sm font-medium text-slate-700">
-                      {checksData?.summary.lastRunTimeFormatted ?? "—"}
-                    </div>
-                  </Card>
-                </div>
-
-                {/* Checks Table */}
-                <Card className="overflow-hidden bg-white shadow-sm border border-slate-200">
-                  <div className="p-4 border-b border-slate-200 flex justify-between items-center">
-                    <div>
-                      <h3 className="text-lg font-semibold text-slate-800">Quality Checks</h3>
-                      <p className="text-xs text-slate-500 mt-1">
-                        Rule-based data quality checks for this table
-                      </p>
-                    </div>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => fetchChecksData()}
-                    >
-                      <RefreshCw className="h-4 w-4 mr-2" /> Refresh
-                    </Button>
-                  </div>
-
-                  {checksData?.checks && checksData.checks.length > 0 ? (
-                    <div className="overflow-x-auto">
-                      <table className="w-full text-sm">
-                        <thead className="bg-slate-50">
-                          <tr>
-                            <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Check Name</th>
-                            <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Scope</th>
-                            <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Target</th>
-                            <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Type</th>
-                            <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Status</th>
-                            <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Severity</th>
-                            <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Pass Rate</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {checksData.checks.map((check, idx) => (
-                            <tr key={check.checkId || idx} className="border-t border-slate-100 hover:bg-slate-50">
-                              <td className="px-4 py-3 font-medium text-slate-800">{check.ruleName}</td>
-                              <td className="px-4 py-3">
-                                <span className={`px-2 py-0.5 rounded text-xs font-medium ${check.scope === "Column"
-                                  ? "bg-purple-100 text-purple-700"
-                                  : "bg-blue-100 text-blue-700"
-                                  }`}>
-                                  {check.scope}
-                                </span>
-                              </td>
-                              <td className="px-4 py-3 text-slate-600 font-mono text-xs">{check.target}</td>
-                              <td className="px-4 py-3 text-slate-600">{check.ruleType}</td>
-                              <td className="px-4 py-3">
-                                <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-bold ${check.checkStatus === "PASS"
-                                  ? "bg-emerald-100 text-emerald-800"
-                                  : check.checkStatus === "WARNING"
-                                    ? "bg-amber-100 text-amber-800"
-                                    : "bg-rose-100 text-rose-800"
-                                  }`}>
-                                  {check.checkStatus === "PASS" && <CheckCircle2 className="h-3 w-3 mr-1" />}
-                                  {check.checkStatus === "FAIL" && <AlertOctagon className="h-3 w-3 mr-1" />}
-                                  {check.checkStatus === "WARNING" && <AlertTriangle className="h-3 w-3 mr-1" />}
-                                  {check.checkStatus}
-                                </span>
-                              </td>
-                              <td className="px-4 py-3">
-                                <span className={`text-xs font-medium ${check.ruleLevel === "Critical"
-                                  ? "text-rose-600"
-                                  : check.ruleLevel === "High"
-                                    ? "text-amber-600"
-                                    : "text-slate-500"
-                                  }`}>
-                                  {check.ruleLevel}
-                                </span>
-                              </td>
-                              <td className="px-4 py-3">
-                                <span className={`text-sm font-bold ${(check.passRate ?? 0) >= 99
-                                  ? "text-emerald-600"
-                                  : (check.passRate ?? 0) >= 95
-                                    ? "text-amber-600"
-                                    : "text-rose-600"
-                                  }`}>
-                                  {check.passRate != null ? `${check.passRate.toFixed(1)}%` : "—"}
-                                </span>
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  ) : (
-                    <div className="flex items-center justify-center h-48 text-slate-400">
-                      <div className="text-center">
-                        <CheckCircle2 className="h-12 w-12 mx-auto mb-3 text-slate-300" />
-                        <p className="text-sm">No quality checks found for this table</p>
-                        <p className="text-xs mt-1">Run profiling or add rules to see checks here</p>
-                      </div>
-                    </div>
-                  )}
                 </Card>
-              </>
-            )}
-          </div>
-        )}
+              )}
+
+              {/* Error State */}
+              {checksError && !isLoadingChecks && (
+                <Card className="p-6 bg-white shadow-sm border border-red-200">
+                  <div className="flex items-center justify-center h-32 text-red-500">
+                    <div className="text-center">
+                      <AlertTriangle className="h-8 w-8 mx-auto mb-2" />
+                      <p className="text-sm">{checksError}</p>
+                      <Button
+                        variant="outline"
+                        className="mt-4"
+                        onClick={() => fetchChecksData()}
+                      >
+                        <RefreshCw className="h-4 w-4 mr-2" /> Retry
+                      </Button>
+                    </div>
+                  </div>
+                </Card>
+              )}
+
+              {/* Checks Content */}
+              {!isLoadingChecks && !checksError && (
+                <>
+                  {/* Summary Cards */}
+                  <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+                    {/* Total Checks */}
+                    <Card className="p-4 bg-white shadow-sm border border-slate-200">
+                      <div className="text-xs text-slate-500 uppercase font-medium mb-1">Total Checks</div>
+                      <div className="text-2xl font-bold text-slate-800">
+                        {checksData?.summary.totalChecks ?? 0}
+                      </div>
+                    </Card>
+
+                    {/* Passed Checks */}
+                    <Card className="p-4 bg-white shadow-sm border-l-4 border-l-emerald-500">
+                      <div className="text-xs text-slate-500 uppercase font-medium mb-1">Passed</div>
+                      <div className="text-2xl font-bold text-emerald-600">
+                        {checksData?.summary.passedChecks ?? 0}
+                      </div>
+                    </Card>
+
+                    {/* Failed Checks */}
+                    <Card className="p-4 bg-white shadow-sm border-l-4 border-l-rose-500">
+                      <div className="text-xs text-slate-500 uppercase font-medium mb-1">Failed</div>
+                      <div className="text-2xl font-bold text-rose-600">
+                        {checksData?.summary.failedChecks ?? 0}
+                      </div>
+                    </Card>
+
+                    {/* Warning Checks */}
+                    <Card className="p-4 bg-white shadow-sm border-l-4 border-l-amber-500">
+                      <div className="text-xs text-slate-500 uppercase font-medium mb-1">Warning</div>
+                      <div className="text-2xl font-bold text-amber-600">
+                        {checksData?.summary.warningChecks ?? 0}
+                      </div>
+                    </Card>
+
+                    {/* Last Run */}
+                    <Card className="p-4 bg-white shadow-sm border border-slate-200">
+                      <div className="text-xs text-slate-500 uppercase font-medium mb-1">Last Run</div>
+                      <div className="text-sm font-medium text-slate-700">
+                        {checksData?.summary.lastRunTimeFormatted ?? "—"}
+                      </div>
+                    </Card>
+                  </div>
+
+                  {/* Checks Table */}
+                  <Card className="overflow-hidden bg-white shadow-sm border border-slate-200">
+                    <div className="p-4 border-b border-slate-200 flex justify-between items-center">
+                      <div>
+                        <h3 className="text-lg font-semibold text-slate-800">Quality Checks</h3>
+                        <p className="text-xs text-slate-500 mt-1">
+                          Rule-based data quality checks for this table
+                        </p>
+                      </div>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => fetchChecksData()}
+                      >
+                        <RefreshCw className="h-4 w-4 mr-2" /> Refresh
+                      </Button>
+                    </div>
+
+                    {checksData?.checks && checksData.checks.length > 0 ? (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-sm">
+                          <thead className="bg-slate-50">
+                            <tr>
+                              <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Check Name</th>
+                              <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Scope</th>
+                              <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Target</th>
+                              <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Type</th>
+                              <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Status</th>
+                              <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Severity</th>
+                              <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Pass Rate</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {checksData.checks.map((check, idx) => (
+                              <tr key={check.checkId || idx} className="border-t border-slate-100 hover:bg-slate-50">
+                                <td className="px-4 py-3 font-medium text-slate-800">{check.ruleName}</td>
+                                <td className="px-4 py-3">
+                                  <span className={`px-2 py-0.5 rounded text-xs font-medium ${check.scope === "Column"
+                                    ? "bg-purple-100 text-purple-700"
+                                    : "bg-blue-100 text-blue-700"
+                                    }`}>
+                                    {check.scope}
+                                  </span>
+                                </td>
+                                <td className="px-4 py-3 text-slate-600 font-mono text-xs">{check.target}</td>
+                                <td className="px-4 py-3 text-slate-600">{check.ruleType}</td>
+                                <td className="px-4 py-3">
+                                  <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-bold ${check.checkStatus === "PASS"
+                                    ? "bg-emerald-100 text-emerald-800"
+                                    : check.checkStatus === "WARNING"
+                                      ? "bg-amber-100 text-amber-800"
+                                      : "bg-rose-100 text-rose-800"
+                                    }`}>
+                                    {check.checkStatus === "PASS" && <CheckCircle2 className="h-3 w-3 mr-1" />}
+                                    {check.checkStatus === "FAIL" && <AlertOctagon className="h-3 w-3 mr-1" />}
+                                    {check.checkStatus === "WARNING" && <AlertTriangle className="h-3 w-3 mr-1" />}
+                                    {check.checkStatus}
+                                  </span>
+                                </td>
+                                <td className="px-4 py-3">
+                                  <span className={`text-xs font-medium ${check.ruleLevel === "Critical"
+                                    ? "text-rose-600"
+                                    : check.ruleLevel === "High"
+                                      ? "text-amber-600"
+                                      : "text-slate-500"
+                                    }`}>
+                                    {check.ruleLevel}
+                                  </span>
+                                </td>
+                                <td className="px-4 py-3">
+                                  <span className={`text-sm font-bold ${(check.passRate ?? 0) >= 99
+                                    ? "text-emerald-600"
+                                    : (check.passRate ?? 0) >= 95
+                                      ? "text-amber-600"
+                                      : "text-rose-600"
+                                    }`}>
+                                    {check.passRate != null ? `${check.passRate.toFixed(1)}%` : "—"}
+                                  </span>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      <div className="flex items-center justify-center h-48 text-slate-400">
+                        <div className="text-center">
+                          <CheckCircle2 className="h-12 w-12 mx-auto mb-3 text-slate-300" />
+                          <p className="text-sm">No quality checks found for this table</p>
+                          <p className="text-xs mt-1">Run profiling or add rules to see checks here</p>
+                        </div>
+                      </div>
+                    )}
+                  </Card>
+                </>
+              )}
+            </div>
+          )
+        }
 
         {/* Anomalies Tab */}
-        {activeTab === "anomalies" && (
-          <div className="space-y-6">
-            {/* Loading State */}
-            {isLoadingAnomalies && (
-              <Card className="p-6 bg-white shadow-sm border border-slate-200">
-                <div className="flex items-center justify-center h-64">
-                  <div className="text-center">
-                    <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-purple-500 mx-auto mb-4"></div>
-                    <p className="text-sm text-slate-500">Detecting anomalies...</p>
+        {
+          activeTab === "anomalies" && (
+            <div className="space-y-6">
+              {/* Loading State */}
+              {isLoadingAnomalies && (
+                <Card className="p-6 bg-white shadow-sm border border-slate-200">
+                  <div className="flex items-center justify-center h-64">
+                    <div className="text-center">
+                      <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-purple-500 mx-auto mb-4"></div>
+                      <p className="text-sm text-slate-500">Detecting anomalies...</p>
+                    </div>
                   </div>
-                </div>
-              </Card>
-            )}
-
-            {/* Error State */}
-            {anomaliesError && !isLoadingAnomalies && (
-              <Card className="p-6 bg-white shadow-sm border border-red-200">
-                <div className="flex items-center justify-center h-32 text-red-500">
-                  <div className="text-center">
-                    <AlertTriangle className="h-8 w-8 mx-auto mb-2" />
-                    <p className="text-sm">{anomaliesError}</p>
-                    <Button
-                      variant="outline"
-                      className="mt-4"
-                      onClick={() => fetchAnomaliesData()}
-                    >
-                      <RefreshCw className="h-4 w-4 mr-2" /> Retry
-                    </Button>
-                  </div>
-                </div>
-              </Card>
-            )}
-
-            {/* Anomalies Content */}
-            {!isLoadingAnomalies && !anomaliesError && (
-              <>
-                {/* Summary Cards */}
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                  {/* Active Anomalies */}
-                  <Card className="p-4 bg-white shadow-sm border-l-4 border-l-rose-500">
-                    <div className="text-xs text-slate-500 uppercase font-medium mb-1">Active</div>
-                    <div className="text-2xl font-bold text-rose-600">
-                      {anomaliesData?.summary.activeAnomalies ?? 0}
-                    </div>
-                  </Card>
-
-                  {/* Critical Anomalies */}
-                  <Card className="p-4 bg-white shadow-sm border-l-4 border-l-purple-500">
-                    <div className="text-xs text-slate-500 uppercase font-medium mb-1">Critical</div>
-                    <div className="text-2xl font-bold text-purple-600">
-                      {anomaliesData?.summary.criticalAnomalies ?? 0}
-                    </div>
-                  </Card>
-
-                  {/* Resolved Anomalies */}
-                  <Card className="p-4 bg-white shadow-sm border-l-4 border-l-emerald-500">
-                    <div className="text-xs text-slate-500 uppercase font-medium mb-1">Resolved</div>
-                    <div className="text-2xl font-bold text-emerald-600">
-                      {anomaliesData?.summary.resolvedAnomalies ?? 0}
-                    </div>
-                  </Card>
-
-                  {/* Last Scan */}
-                  <Card className="p-4 bg-white shadow-sm border border-slate-200">
-                    <div className="text-xs text-slate-500 uppercase font-medium mb-1">Last Scan</div>
-                    <div className="text-sm font-medium text-slate-700">
-                      {anomaliesData?.summary.lastScanTimeFormatted ?? "—"}
-                    </div>
-                  </Card>
-                </div>
-
-                {/* Anomalies Table */}
-                <Card className="overflow-hidden bg-white shadow-sm border border-slate-200">
-                  <div className="p-4 border-b border-slate-200 flex justify-between items-center">
-                    <div>
-                      <h3 className="text-lg font-semibold text-slate-800">Detected Anomalies</h3>
-                      <p className="text-xs text-slate-500 mt-1">
-                        Statistical deviations from historical baselines
-                      </p>
-                    </div>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => fetchAnomaliesData()}
-                    >
-                      <RefreshCw className="h-4 w-4 mr-2" /> Scan Now
-                    </Button>
-                  </div>
-
-                  {anomaliesData?.anomalies && anomaliesData.anomalies.length > 0 ? (
-                    <div className="overflow-x-auto">
-                      <table className="w-full text-sm">
-                        <thead className="bg-slate-50">
-                          <tr>
-                            <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Metric</th>
-                            <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Scope</th>
-                            <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Target</th>
-                            <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Severity</th>
-                            <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Baseline</th>
-                            <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Current</th>
-                            <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Deviation</th>
-                            <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Status</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {anomaliesData.anomalies.map((anomaly, idx) => (
-                            <tr key={anomaly.anomalyId || idx} className="border-t border-slate-100 hover:bg-slate-50">
-                              <td className="px-4 py-3 font-medium text-slate-800">{anomaly.metric}</td>
-                              <td className="px-4 py-3">
-                                <span className={`px-2 py-0.5 rounded text-xs font-medium ${anomaly.scope === "Column"
-                                  ? "bg-purple-100 text-purple-700"
-                                  : "bg-blue-100 text-blue-700"
-                                  }`}>
-                                  {anomaly.scope}
-                                </span>
-                              </td>
-                              <td className="px-4 py-3 text-slate-600 font-mono text-xs">{anomaly.target}</td>
-                              <td className="px-4 py-3">
-                                <span className={`px-2 py-0.5 rounded-full text-xs font-bold ${anomaly.severity === "Critical"
-                                  ? "bg-rose-100 text-rose-800"
-                                  : anomaly.severity === "High"
-                                    ? "bg-amber-100 text-amber-800"
-                                    : anomaly.severity === "Medium"
-                                      ? "bg-yellow-100 text-yellow-800"
-                                      : "bg-slate-100 text-slate-600"
-                                  }`}>
-                                  {anomaly.severity}
-                                </span>
-                              </td>
-                              <td className="px-4 py-3 text-slate-600">{anomaly.baseline?.toLocaleString()}</td>
-                              <td className="px-4 py-3 text-slate-600">{anomaly.current?.toLocaleString()}</td>
-                              <td className="px-4 py-3">
-                                <span className={`text-sm font-bold ${anomaly.deviationPct > 0
-                                  ? "text-amber-600"
-                                  : "text-rose-600"
-                                  }`}>
-                                  {anomaly.deviationPct > 0 ? "+" : ""}{anomaly.deviationPct}%
-                                </span>
-                              </td>
-                              <td className="px-4 py-3">
-                                <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-bold ${anomaly.status === "Active"
-                                  ? "bg-rose-100 text-rose-800"
-                                  : "bg-emerald-100 text-emerald-800"
-                                  }`}>
-                                  {anomaly.status}
-                                </span>
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  ) : (
-                    <div className="flex items-center justify-center h-48 text-slate-400">
-                      <div className="text-center">
-                        <CheckCircle2 className="h-12 w-12 mx-auto mb-3 text-emerald-300" />
-                        <p className="text-sm font-medium text-emerald-600">No anomalies detected</p>
-                        <p className="text-xs mt-1 text-slate-400">All metrics are within normal ranges</p>
-                      </div>
-                    </div>
-                  )}
                 </Card>
-              </>
-            )}
-          </div>
-        )}
+              )}
+
+              {/* Error State */}
+              {anomaliesError && !isLoadingAnomalies && (
+                <Card className="p-6 bg-white shadow-sm border border-red-200">
+                  <div className="flex items-center justify-center h-32 text-red-500">
+                    <div className="text-center">
+                      <AlertTriangle className="h-8 w-8 mx-auto mb-2" />
+                      <p className="text-sm">{anomaliesError}</p>
+                      <Button
+                        variant="outline"
+                        className="mt-4"
+                        onClick={() => fetchAnomaliesData()}
+                      >
+                        <RefreshCw className="h-4 w-4 mr-2" /> Retry
+                      </Button>
+                    </div>
+                  </div>
+                </Card>
+              )}
+
+              {/* Anomalies Content */}
+              {!isLoadingAnomalies && !anomaliesError && (
+                <>
+                  {/* Summary Cards */}
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                    {/* Active Anomalies */}
+                    <Card className="p-4 bg-white shadow-sm border-l-4 border-l-rose-500">
+                      <div className="text-xs text-slate-500 uppercase font-medium mb-1">Active</div>
+                      <div className="text-2xl font-bold text-rose-600">
+                        {anomaliesData?.summary.activeAnomalies ?? 0}
+                      </div>
+                    </Card>
+
+                    {/* Critical Anomalies */}
+                    <Card className="p-4 bg-white shadow-sm border-l-4 border-l-purple-500">
+                      <div className="text-xs text-slate-500 uppercase font-medium mb-1">Critical</div>
+                      <div className="text-2xl font-bold text-purple-600">
+                        {anomaliesData?.summary.criticalAnomalies ?? 0}
+                      </div>
+                    </Card>
+
+                    {/* Resolved Anomalies */}
+                    <Card className="p-4 bg-white shadow-sm border-l-4 border-l-emerald-500">
+                      <div className="text-xs text-slate-500 uppercase font-medium mb-1">Resolved</div>
+                      <div className="text-2xl font-bold text-emerald-600">
+                        {anomaliesData?.summary.resolvedAnomalies ?? 0}
+                      </div>
+                    </Card>
+
+                    {/* Last Scan */}
+                    <Card className="p-4 bg-white shadow-sm border border-slate-200">
+                      <div className="text-xs text-slate-500 uppercase font-medium mb-1">Last Scan</div>
+                      <div className="text-sm font-medium text-slate-700">
+                        {anomaliesData?.summary.lastScanTimeFormatted ?? "—"}
+                      </div>
+                    </Card>
+                  </div>
+
+                  {/* Anomalies Table */}
+                  <Card className="overflow-hidden bg-white shadow-sm border border-slate-200">
+                    <div className="p-4 border-b border-slate-200 flex justify-between items-center">
+                      <div>
+                        <h3 className="text-lg font-semibold text-slate-800">Detected Anomalies</h3>
+                        <p className="text-xs text-slate-500 mt-1">
+                          Statistical deviations from historical baselines
+                        </p>
+                      </div>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => fetchAnomaliesData()}
+                      >
+                        <RefreshCw className="h-4 w-4 mr-2" /> Scan Now
+                      </Button>
+                    </div>
+
+                    {anomaliesData?.anomalies && anomaliesData.anomalies.length > 0 ? (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-sm">
+                          <thead className="bg-slate-50">
+                            <tr>
+                              <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Metric</th>
+                              <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Scope</th>
+                              <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Target</th>
+                              <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Severity</th>
+                              <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Baseline</th>
+                              <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Current</th>
+                              <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Deviation</th>
+                              <th className="text-left px-4 py-3 text-xs text-slate-600 font-semibold">Status</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {anomaliesData.anomalies.map((anomaly, idx) => (
+                              <tr key={anomaly.anomalyId || idx} className="border-t border-slate-100 hover:bg-slate-50">
+                                <td className="px-4 py-3 font-medium text-slate-800">{anomaly.metric}</td>
+                                <td className="px-4 py-3">
+                                  <span className={`px-2 py-0.5 rounded text-xs font-medium ${anomaly.scope === "Column"
+                                    ? "bg-purple-100 text-purple-700"
+                                    : "bg-blue-100 text-blue-700"
+                                    }`}>
+                                    {anomaly.scope}
+                                  </span>
+                                </td>
+                                <td className="px-4 py-3 text-slate-600 font-mono text-xs">{anomaly.target}</td>
+                                <td className="px-4 py-3">
+                                  <span className={`px-2 py-0.5 rounded-full text-xs font-bold ${anomaly.severity === "Critical"
+                                    ? "bg-rose-100 text-rose-800"
+                                    : anomaly.severity === "High"
+                                      ? "bg-amber-100 text-amber-800"
+                                      : anomaly.severity === "Medium"
+                                        ? "bg-yellow-100 text-yellow-800"
+                                        : "bg-slate-100 text-slate-600"
+                                    }`}>
+                                    {anomaly.severity}
+                                  </span>
+                                </td>
+                                <td className="px-4 py-3 text-slate-600">{anomaly.baseline?.toLocaleString()}</td>
+                                <td className="px-4 py-3 text-slate-600">{anomaly.current?.toLocaleString()}</td>
+                                <td className="px-4 py-3">
+                                  <span className={`text-sm font-bold ${anomaly.deviationPct > 0
+                                    ? "text-amber-600"
+                                    : "text-rose-600"
+                                    }`}>
+                                    {anomaly.deviationPct > 0 ? "+" : ""}{anomaly.deviationPct}%
+                                  </span>
+                                </td>
+                                <td className="px-4 py-3">
+                                  <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-bold ${anomaly.status === "Active"
+                                    ? "bg-rose-100 text-rose-800"
+                                    : "bg-emerald-100 text-emerald-800"
+                                    }`}>
+                                    {anomaly.status}
+                                  </span>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      <div className="flex items-center justify-center h-48 text-slate-400">
+                        <div className="text-center">
+                          <CheckCircle2 className="h-12 w-12 mx-auto mb-3 text-emerald-300" />
+                          <p className="text-sm font-medium text-emerald-600">No anomalies detected</p>
+                          <p className="text-xs mt-1 text-slate-400">All metrics are within normal ranges</p>
+                        </div>
+                      </div>
+                    )}
+                  </Card>
+                </>
+              )}
+            </div>
+          )
+        }
 
         {/* Data Preview Tab */}
-        {activeTab === "data-preview" && (
-          <Card className="overflow-hidden border border-slate-200 shadow-md">
-            {isLoadingPreview ? (
-              <div className="flex items-center justify-center h-64 p-6">
-                <div className="text-center">
-                  <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-500 mx-auto mb-4"></div>
-                  <p className="text-sm text-slate-500">Loading table data...</p>
-                </div>
-              </div>
-            ) : previewError ? (
-              <div className="flex items-center justify-center h-64 p-6">
-                <div className="text-center">
-                  <p className="text-sm text-red-500 mb-4">{previewError}</p>
-                  <Button onClick={fetchPreviewData} variant="outline" size="sm">
-                    Retry
-                  </Button>
-                </div>
-              </div>
-            ) : !previewData ? (
-              <div className="flex items-center justify-center h-64 text-slate-400 p-6">
-                <p className="text-sm">Click to load table preview</p>
-              </div>
-            ) : (
-              <>
-                <div className="p-4 border-b border-slate-100 bg-slate-50 flex justify-between items-center">
-                  <h3 className="font-bold text-slate-800 flex items-center gap-2">
-                    <TableIcon size={16} /> Live Data Preview
-                  </h3>
-                  <div className="flex gap-2">
-                    <Button
-                      onClick={fetchPreviewData}
-                      variant="ghost"
-                      className="text-xs h-8 hover:bg-slate-200"
-                    >
-                      <RefreshCw size={14} className="mr-1" /> Refresh
-                    </Button>
-                  </div>
-                </div>
-
-                <div className="overflow-x-auto custom-scrollbar max-h-150">
-                  <table className="w-full text-base text-left border-collapse">
-                    <thead className="bg-slate-100 sticky top-0 z-10 text-sm font-bold text-slate-700 shadow-sm">
-                      <tr>
-                        {previewData.columns.map((column, idx) => (
-                          <th
-                            key={idx}
-                            className="px-6 py-4 border-r border-slate-200 last:border-0 whitespace-nowrap bg-slate-100"
-                          >
-                            <div className="font-bold text-slate-900 text-sm">
-                              {column.name}
-                            </div>
-                            <div className="text-xs font-normal text-slate-600 mt-1">
-                              {column.type}
-                            </div>
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-100">
-                      {previewData.rows.map((row, rowIndex) => (
-                        <tr key={rowIndex} className="hover:bg-indigo-50/30 transition-colors">
-                          {previewData.columns.map((column, colIndex) => (
-                            <td
-                              key={colIndex}
-                              className="px-6 py-3 border-r border-slate-100 last:border-0 text-slate-600 font-mono text-sm"
-                            >
-                              {row[column.name] === null ? (
-                                <span className="text-slate-400 italic">NULL</span>
-                              ) : typeof row[column.name] === "object" ? (
-                                <span className="text-slate-600">
-                                  {JSON.stringify(row[column.name])}
-                                </span>
-                              ) : (
-                                <span className="text-slate-900">
-                                  {String(row[column.name])}
-                                </span>
-                              )}
-                            </td>
-                          ))}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-
-                <div className="p-3 bg-slate-50 border-t border-slate-200 text-xs text-slate-500 flex justify-center">
-                  Showing {previewData.rows.length} rows (Limit 100)
-                </div>
-              </>
-            )}
-          </Card>
-        )}
-
-        {/* Failed Records Tab */}
-        {activeTab === "failed-records" && (
-          <Card className="overflow-hidden border border-slate-200 shadow-md">
-            {isLoadingFailedRecords ? (
-              <div className="flex items-center justify-center h-64 p-6">
-                <div className="text-center">
-                  <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-500 mx-auto mb-4"></div>
-                  <p className="text-sm text-slate-500">Loading failed records...</p>
-                </div>
-              </div>
-            ) : failedRecordsError ? (
-              <div className="flex items-center justify-center h-64 p-6">
-                <div className="text-center">
-                  <p className="text-sm text-red-500 mb-4">{failedRecordsError}</p>
-                  <Button onClick={fetchFailedRecords} variant="outline" size="sm">
-                    Retry
-                  </Button>
-                </div>
-              </div>
-            ) : !failedRecordsData ? (
-              <div className="flex items-center justify-center h-64 text-slate-400 p-6">
-                <p className="text-sm">Click to load failed records</p>
-              </div>
-            ) : failedRecordsData.rows.length === 0 ? (
-              <div className="flex items-center justify-center h-64 p-6">
-                <div className="text-center">
-                  <CheckCircle2 className="text-emerald-500 mx-auto mb-4" size={48} />
-                  <p className="text-lg font-semibold text-slate-700">No Failed Records</p>
-                  <p className="text-sm text-slate-500 mt-2">This table has no failed quality checks.</p>
-                </div>
-              </div>
-            ) : (
-              <>
-                <div className="p-4 border-b border-slate-100 bg-slate-50 flex justify-between items-center">
-                  <h3 className="font-bold text-slate-800 flex items-center gap-2">
-                    <AlertOctagon size={16} className="text-red-600" /> Failed Records
-                    <span className="text-xs font-normal text-slate-500 ml-2">
-                      ({failedRecordsData.rows.length} failures)
-                    </span>
-                  </h3>
-                  <div className="flex gap-2">
-                    <Button
-                      onClick={fetchFailedRecords}
-                      variant="ghost"
-                      className="text-xs h-8 hover:bg-slate-200"
-                    >
-                      <RefreshCw size={14} className="mr-1" /> Refresh
-                    </Button>
-                  </div>
-                </div>
-
-                <div className="overflow-x-auto custom-scrollbar max-h-150">
-                  <table className="w-full text-base text-left border-collapse">
-                    <thead className="bg-slate-100 sticky top-0 z-10 text-sm font-bold text-slate-700 shadow-sm">
-                      <tr>
-                        {failedRecordsData.columns.map((column, idx) => (
-                          <th
-                            key={idx}
-                            className="px-6 py-4 border-r border-slate-200 last:border-0 whitespace-nowrap bg-slate-100"
-                          >
-                            <div className="font-bold text-slate-900 text-sm">
-                              {column.name}
-                            </div>
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-100">
-                      {failedRecordsData.rows.map((row, rowIndex) => (
-                        <tr key={rowIndex} className="hover:bg-red-50/30 transition-colors">
-                          {failedRecordsData.columns.map((column, colIndex) => (
-                            <td
-                              key={colIndex}
-                              className="px-6 py-3 border-r border-slate-100 last:border-0 text-slate-600 font-mono text-sm"
-                            >
-                              {row[column.name] === null ? (
-                                <span className="text-slate-400 italic">NULL</span>
-                              ) : column.name === "IS_CRITICAL" ? (
-                                <span className={`px-2 py-1 rounded text-xs font-semibold ${row[column.name] ? "bg-red-100 text-red-700" : "bg-slate-100 text-slate-600"
-                                  }`}>
-                                  {row[column.name] ? "CRITICAL" : "Normal"}
-                                </span>
-                              ) : column.name === "CAN_AUTO_REMEDIATE" ? (
-                                <span className={`px-2 py-1 rounded text-xs font-semibold ${row[column.name] ? "bg-green-100 text-green-700" : "bg-slate-100 text-slate-600"
-                                  }`}>
-                                  {row[column.name] ? "Yes" : "No"}
-                                </span>
-                              ) : typeof row[column.name] === "object" ? (
-                                <span className="text-slate-600">
-                                  {JSON.stringify(row[column.name])}
-                                </span>
-                              ) : (
-                                <span className="text-slate-900">
-                                  {String(row[column.name])}
-                                </span>
-                              )}
-                            </td>
-                          ))}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-
-                <div className="p-3 bg-slate-50 border-t border-slate-200 text-xs text-slate-500 flex justify-center">
-                  Showing {failedRecordsData.rows.length} failed records (Limit 100)
-                </div>
-              </>
-            )}
-          </Card>
-        )}
-
-        {/* Activity Tab */}
-        {activeTab === "activity" && (
-          <>
+        {
+          activeTab === "data-preview" && (
             <Card className="overflow-hidden border border-slate-200 shadow-md">
-              {isLoadingActivity ? (
+              {isLoadingPreview ? (
                 <div className="flex items-center justify-center h-64 p-6">
                   <div className="text-center">
                     <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-500 mx-auto mb-4"></div>
-                    <p className="text-sm text-slate-500">Loading activity...</p>
+                    <p className="text-sm text-slate-500">Loading table data...</p>
                   </div>
                 </div>
-              ) : activityError ? (
+              ) : previewError ? (
                 <div className="flex items-center justify-center h-64 p-6">
                   <div className="text-center">
-                    <p className="text-sm text-red-500 mb-4">{activityError}</p>
-                    <Button onClick={fetchActivity} variant="outline" size="sm">
+                    <p className="text-sm text-red-500 mb-4">{previewError}</p>
+                    <Button onClick={fetchPreviewData} variant="outline" size="sm">
                       Retry
                     </Button>
                   </div>
                 </div>
-              ) : activityData.length === 0 ? (
-                <div className="flex items-center justify-center h-64 p-6">
-                  <div className="text-center">
-                    <Activity size={48} className="text-slate-300 mx-auto mb-4" />
-                    <p className="text-lg font-semibold text-slate-700">No Activity Yet</p>
-                    <p className="text-sm text-slate-500 mt-2">Run a custom scan to see activity here.</p>
-                  </div>
+              ) : !previewData ? (
+                <div className="flex items-center justify-center h-64 text-slate-400 p-6">
+                  <p className="text-sm">Click to load table preview</p>
                 </div>
               ) : (
                 <>
                   <div className="p-4 border-b border-slate-100 bg-slate-50 flex justify-between items-center">
                     <h3 className="font-bold text-slate-800 flex items-center gap-2">
-                      <Activity size={16} className="text-indigo-600" /> Recent Runs
-                      <span className="text-xs font-normal text-slate-500 ml-2">
-                        ({activityData.length} runs)
-                      </span>
+                      <TableIcon size={16} /> Live Data Preview
                     </h3>
-                    <Button
-                      onClick={fetchActivity}
-                      variant="ghost"
-                      className="text-xs h-8 hover:bg-slate-200"
-                    >
-                      <RefreshCw size={14} className="mr-1" /> Refresh
-                    </Button>
+                    <div className="flex gap-2">
+                      <Button
+                        onClick={fetchPreviewData}
+                        variant="ghost"
+                        className="text-xs h-8 hover:bg-slate-200"
+                      >
+                        <RefreshCw size={14} className="mr-1" /> Refresh
+                      </Button>
+                    </div>
                   </div>
 
-                  <div className="overflow-x-auto custom-scrollbar">
-                    <table className="w-full text-sm text-left border-collapse">
-                      <thead className="bg-slate-100 sticky top-0 z-10 text-xs font-bold text-slate-700">
+                  <div className="overflow-x-auto custom-scrollbar max-h-150">
+                    <table className="w-full text-base text-left border-collapse">
+                      <thead className="bg-slate-100 sticky top-0 z-10 text-sm font-bold text-slate-700 shadow-sm">
                         <tr>
-                          <th className="px-4 py-3 whitespace-nowrap">Run Type</th>
-                          <th className="px-4 py-3 whitespace-nowrap">Status</th>
-                          <th className="px-4 py-3 whitespace-nowrap">Started At</th>
-                          <th className="px-4 py-3 whitespace-nowrap">Duration</th>
-                          <th className="px-4 py-3 whitespace-nowrap text-center">Total Checks</th>
-                          <th className="px-4 py-3 whitespace-nowrap text-center">Failed</th>
-                          <th className="px-4 py-3 whitespace-nowrap text-center">Warnings</th>
-                          <th className="px-4 py-3 whitespace-nowrap">Triggered By</th>
-                          <th className="px-4 py-3 whitespace-nowrap text-center w-16">Actions</th>
+                          {previewData.columns.map((column, idx) => (
+                            <th
+                              key={idx}
+                              className="px-6 py-4 border-r border-slate-200 last:border-0 whitespace-nowrap bg-slate-100"
+                            >
+                              <div className="font-bold text-slate-900 text-sm">
+                                {column.name}
+                              </div>
+                              <div className="text-xs font-normal text-slate-600 mt-1">
+                                {column.type}
+                              </div>
+                            </th>
+                          ))}
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-100">
-                        {activityData.map((run: any) => (
-                          <tr
-                            key={run.run_id}
-                            className={`hover:bg-indigo-50/50 transition-colors cursor-pointer ${selectedRunId === run.run_id ? "bg-indigo-50" : ""
-                              }`}
-                            onClick={() => setSelectedRunId(run.run_id)}
-                          >
-                            <td className="px-4 py-3">
-                              <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold ${run.run_type === "CUSTOM_SCAN"
-                                ? "bg-purple-100 text-purple-700"
-                                : run.run_type === "PROFILING"
-                                  ? "bg-teal-100 text-teal-700"
-                                  : "bg-blue-100 text-blue-700"
-                                }`}>
-                                {run.run_type === "CUSTOM_SCAN" ? (
-                                  <>
-                                    <Settings size={12} />
-                                    Custom Scan
-                                  </>
-                                ) : run.run_type === "PROFILING" ? (
-                                  <>
-                                    <BarChart2 size={12} />
-                                    Profiling
-                                  </>
+                        {previewData.rows.map((row, rowIndex) => (
+                          <tr key={rowIndex} className="hover:bg-indigo-50/30 transition-colors">
+                            {previewData.columns.map((column, colIndex) => (
+                              <td
+                                key={colIndex}
+                                className="px-6 py-3 border-r border-slate-100 last:border-0 text-slate-600 font-mono text-sm"
+                              >
+                                {row[column.name] === null ? (
+                                  <span className="text-slate-400 italic">NULL</span>
+                                ) : typeof row[column.name] === "object" ? (
+                                  <span className="text-slate-600">
+                                    {JSON.stringify(row[column.name])}
+                                  </span>
                                 ) : (
-                                  <>
-                                    <PlayCircle size={12} />
-                                    Full Scan
-                                  </>
+                                  <span className="text-slate-900">
+                                    {String(row[column.name])}
+                                  </span>
                                 )}
-                              </span>
-                            </td>
-                            <td className="px-4 py-3">
-                              <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold ${run.run_status === "COMPLETED"
-                                ? "bg-emerald-100 text-emerald-700"
-                                : run.run_status === "COMPLETED_WITH_FAILURES"
-                                  ? "bg-red-100 text-red-700"
-                                  : run.run_status === "FAILED"
-                                    ? "bg-orange-100 text-orange-700"
-                                    : run.run_status === "RUNNING"
-                                      ? "bg-indigo-100 text-indigo-700"
-                                      : "bg-slate-100 text-slate-700"
-                                }`}>
-                                {run.run_status === "COMPLETED" && <CheckCircle2 size={12} />}
-                                {run.run_status === "COMPLETED_WITH_FAILURES" && <AlertOctagon size={12} />}
-                                {run.run_status === "FAILED" && <AlertOctagon size={12} />}
-                                {run.run_status === "COMPLETED"
-                                  ? "Completed"
-                                  : run.run_status === "COMPLETED_WITH_FAILURES"
-                                    ? "Failed Checks"
-                                    : run.run_status === "FAILED"
-                                      ? "Failed"
-                                      : run.run_status}
-                              </span>
-                            </td>
-                            <td className="px-4 py-3 text-slate-600">
-                              {run.start_ts ? new Date(run.start_ts).toLocaleString() : "-"}
-                            </td>
-                            <td className="px-4 py-3 text-slate-600 font-mono">
-                              {run.duration_seconds !== null && run.duration_seconds !== undefined
-                                ? `${run.duration_seconds.toFixed(2)}s`
-                                : "-"}
-                            </td>
-                            <td className="px-4 py-3 text-center font-semibold text-slate-900">
-                              {run.total_checks ?? 0}
-                            </td>
-                            <td className="px-4 py-3 text-center">
-                              <span className={`font-semibold ${(run.failed_checks ?? 0) > 0 ? "text-red-600" : "text-slate-500"
-                                }`}>
-                                {run.failed_checks ?? 0}
-                              </span>
-                            </td>
-                            <td className="px-4 py-3 text-center">
-                              <span className={`font-semibold ${(run.warning_checks ?? 0) > 0 ? "text-yellow-600" : "text-slate-500"
-                                }`}>
-                                {run.warning_checks ?? 0}
-                              </span>
-                            </td>
-                            <td className="px-4 py-3 text-slate-600">
-                              {run.triggered_by || "-"}
-                            </td>
-                            <td className="px-4 py-3 text-center">
-                              <DropdownMenu>
-                                <DropdownMenuTrigger asChild>
-                                  <Button
-                                    variant="ghost"
-                                    size="sm"
-                                    className="h-8 w-8 p-0 hover:bg-slate-200"
-                                    onClick={(e) => e.stopPropagation()}
-                                  >
-                                    {isRerunning === run.run_id ? (
-                                      <Loader2 className="h-4 w-4 animate-spin" />
-                                    ) : (
-                                      <MoreVertical className="h-4 w-4" />
-                                    )}
-                                  </Button>
-                                </DropdownMenuTrigger>
-                                <DropdownMenuContent align="end" className="w-40 bg-white">
-                                  <DropdownMenuItem
-                                    className="cursor-pointer flex items-center gap-2"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      handleViewResults(run.run_id);
-                                    }}
-                                  >
-                                    <Eye className="h-4 w-4" />
-                                    View Results
-                                  </DropdownMenuItem>
-                                  <DropdownMenuItem
-                                    className="cursor-pointer flex items-center gap-2"
-                                    disabled={isRerunning !== null}
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      handleRerun(run.run_id);
-                                    }}
-                                  >
-                                    <RefreshCw className={`h-4 w-4 ${isRerunning === run.run_id ? "animate-spin" : ""}`} />
-                                    Rerun
-                                  </DropdownMenuItem>
-                                  <DropdownMenuItem
-                                    className="cursor-pointer flex items-center gap-2"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      // Pre-fill schedule from run context
-                                      setNewSchedule(prev => ({
-                                        ...prev,
-                                        scanType: run.scan_type || "profiling",
-                                      }));
-                                      setScheduleFromRun(run);
-                                      setShowScheduleModal(true);
-                                    }}
-                                  >
-                                    <Calendar className="h-4 w-4" />
-                                    Schedule
-                                  </DropdownMenuItem>
-                                </DropdownMenuContent>
-                              </DropdownMenu>
-                            </td>
+                              </td>
+                            ))}
                           </tr>
                         ))}
                       </tbody>
                     </table>
                   </div>
 
-                  {selectedRunId && (
-                    <div className="p-3 bg-indigo-50 border-t border-indigo-100 text-xs text-indigo-700 flex items-center justify-between">
-                      <span className="font-mono">Selected Run: {selectedRunId}</span>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="text-xs h-7 text-indigo-700 hover:bg-indigo-100"
-                        onClick={() => setSelectedRunId(null)}
-                      >
-                        Clear Selection
-                      </Button>
-                    </div>
-                  )}
-
                   <div className="p-3 bg-slate-50 border-t border-slate-200 text-xs text-slate-500 flex justify-center">
-                    Showing {activityData.length} recent runs (Limit 20)
+                    Showing {previewData.rows.length} rows (Limit 100)
                   </div>
                 </>
               )}
             </Card>
+          )
+        }
 
-            {/* Scheduled Scans Panel */}
-            <Card className="overflow-hidden border border-slate-200 shadow-md mt-4">
-              <div className="p-4 border-b border-slate-100 bg-slate-50 flex justify-between items-center">
-                <h3 className="font-bold text-slate-800 flex items-center gap-2">
-                  <Calendar size={16} className="text-indigo-600" /> Scheduled Scans
-                  <span className="text-xs font-normal text-slate-500 ml-2">
-                    ({schedulesData.filter(s => s.status === 'active').length} active)
-                  </span>
-                </h3>
-                <Button
-                  size="sm"
-                  onClick={() => setShowScheduleModal(true)}
-                  className="bg-indigo-600 hover:bg-indigo-700 text-white"
-                >
-                  <Plus size={14} className="mr-1" /> New Schedule
-                </Button>
-              </div>
-
-              {isLoadingSchedules ? (
-                <div className="flex items-center justify-center h-32 p-6">
+        {/* Failed Records Tab */}
+        {
+          activeTab === "failed-records" && (
+            <Card className="overflow-hidden border border-slate-200 shadow-md">
+              {isLoadingFailedRecords ? (
+                <div className="flex items-center justify-center h-64 p-6">
                   <div className="text-center">
-                    <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-indigo-500 mx-auto mb-3"></div>
-                    <p className="text-sm text-slate-500">Loading schedules...</p>
+                    <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-500 mx-auto mb-4"></div>
+                    <p className="text-sm text-slate-500">Loading failed records...</p>
                   </div>
                 </div>
-              ) : schedulesData.length === 0 ? (
-                <div className="flex items-center justify-center h-32 p-6">
+              ) : failedRecordsError ? (
+                <div className="flex items-center justify-center h-64 p-6">
                   <div className="text-center">
-                    <Calendar size={32} className="text-slate-300 mx-auto mb-3" />
-                    <p className="text-sm font-medium text-slate-700">No Scheduled Scans</p>
-                    <p className="text-xs text-slate-500 mt-1">Create a schedule to automate your scans</p>
+                    <p className="text-sm text-red-500 mb-4">{failedRecordsError}</p>
+                    <Button onClick={fetchFailedRecords} variant="outline" size="sm">
+                      Retry
+                    </Button>
+                  </div>
+                </div>
+              ) : !failedRecordsData ? (
+                <div className="flex items-center justify-center h-64 text-slate-400 p-6">
+                  <p className="text-sm">Click to load failed records</p>
+                </div>
+              ) : failedRecordsData.rows.length === 0 ? (
+                <div className="flex items-center justify-center h-64 p-6">
+                  <div className="text-center">
+                    <CheckCircle2 className="text-emerald-500 mx-auto mb-4" size={48} />
+                    <p className="text-lg font-semibold text-slate-700">No Failed Records</p>
+                    <p className="text-sm text-slate-500 mt-2">This table has no failed quality checks.</p>
                   </div>
                 </div>
               ) : (
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
-                    <thead className="bg-slate-50 text-slate-600 text-xs uppercase">
-                      <tr>
-                        <th className="px-4 py-3 text-left font-semibold">Scan Type</th>
-                        <th className="px-4 py-3 text-left font-semibold">Frequency</th>
-                        <th className="px-4 py-3 text-left font-semibold">Next Run</th>
-                        <th className="px-4 py-3 text-left font-semibold">Last Run</th>
-                        <th className="px-4 py-3 text-left font-semibold">Status</th>
-                        <th className="px-4 py-3 text-center font-semibold">Actions</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-100">
-                      {schedulesData.map((schedule: any) => (
-                        <tr key={schedule.scheduleId} className="hover:bg-slate-50 transition-colors">
-                          <td className="px-4 py-3">
-                            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-indigo-50 text-indigo-700">
-                              {schedule.scanType === 'profiling' && <Database size={12} />}
-                              {schedule.scanType === 'checks' && <CheckCircle size={12} />}
-                              {schedule.scanType === 'anomalies' && <Activity size={12} />}
-                              {schedule.scanType === 'full' && <Play size={12} />}
-                              {schedule.scanType.charAt(0).toUpperCase() + schedule.scanType.slice(1)}
-                            </span>
-                          </td>
-                          <td className="px-4 py-3 text-slate-700">
-                            <div className="flex items-center gap-1.5">
-                              <Clock size={12} className="text-slate-400" />
-                              {schedule.scheduleType === 'hourly' && 'Every hour'}
-                              {schedule.scheduleType === 'daily' && `Daily at ${schedule.scheduleTime || '00:00'}`}
-                              {schedule.scheduleType === 'weekly' && `Weekly on ${schedule.scheduleDayOfWeek || 'Mon'}`}
-                              {schedule.scheduleType === 'once' && 'One-time'}
-                            </div>
-                          </td>
-                          <td className="px-4 py-3 text-slate-600 text-xs">
-                            {schedule.nextRunAt ? new Date(schedule.nextRunAt).toLocaleString() : '-'}
-                          </td>
-                          <td className="px-4 py-3 text-slate-600 text-xs">
-                            {schedule.lastRunAt ? new Date(schedule.lastRunAt).toLocaleString() : 'Never'}
-                          </td>
-                          <td className="px-4 py-3">
-                            <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium ${schedule.status === 'active'
-                              ? 'bg-green-50 text-green-700'
-                              : schedule.status === 'paused'
-                                ? 'bg-amber-50 text-amber-700'
-                                : 'bg-slate-100 text-slate-500'
-                              }`}>
-                              {schedule.status === 'active' && <CheckCircle size={10} />}
-                              {schedule.status === 'paused' && <Pause size={10} />}
-                              {schedule.status.charAt(0).toUpperCase() + schedule.status.slice(1)}
-                            </span>
-                          </td>
-                          <td className="px-4 py-3">
-                            <div className="flex items-center justify-center gap-1">
-                              <Button
-                                size="sm"
-                                variant="ghost"
-                                className="h-7 px-2 text-green-600 hover:text-green-700 hover:bg-green-50"
-                                onClick={() => runScheduleNow(schedule.scheduleId)}
-                                title="Run Now"
-                              >
-                                <PlayCircle size={14} />
-                              </Button>
-                              <Button
-                                size="sm"
-                                variant="ghost"
-                                className="h-7 px-2 text-slate-600 hover:text-indigo-600"
-                                onClick={() => toggleSchedule(schedule.scheduleId, schedule.status === 'active' ? 'paused' : 'active')}
-                                title={schedule.status === 'active' ? 'Pause' : 'Resume'}
-                              >
-                                {schedule.status === 'active' ? <Pause size={14} /> : <Play size={14} />}
-                              </Button>
-                              <Button
-                                size="sm"
-                                variant="ghost"
-                                className="h-7 px-2 text-slate-600 hover:text-red-600"
-                                onClick={() => deleteSchedule(schedule.scheduleId)}
-                                title="Delete"
-                              >
-                                <Trash2 size={14} />
-                              </Button>
-                            </div>
-                          </td>
+                <>
+                  <div className="p-4 border-b border-slate-100 bg-slate-50 flex justify-between items-center">
+                    <h3 className="font-bold text-slate-800 flex items-center gap-2">
+                      <AlertOctagon size={16} className="text-red-600" /> Failed Records
+                      <span className="text-xs font-normal text-slate-500 ml-2">
+                        ({failedRecordsData.rows.length} failures)
+                      </span>
+                    </h3>
+                    <div className="flex gap-2">
+                      <Button
+                        onClick={fetchFailedRecords}
+                        variant="ghost"
+                        className="text-xs h-8 hover:bg-slate-200"
+                      >
+                        <RefreshCw size={14} className="mr-1" /> Refresh
+                      </Button>
+                    </div>
+                  </div>
+
+                  <div className="overflow-x-auto custom-scrollbar max-h-150">
+                    <table className="w-full text-base text-left border-collapse">
+                      <thead className="bg-slate-100 sticky top-0 z-10 text-sm font-bold text-slate-700 shadow-sm">
+                        <tr>
+                          {failedRecordsData.columns.map((column, idx) => (
+                            <th
+                              key={idx}
+                              className="px-6 py-4 border-r border-slate-200 last:border-0 whitespace-nowrap bg-slate-100"
+                            >
+                              <div className="font-bold text-slate-900 text-sm">
+                                {column.name}
+                              </div>
+                            </th>
+                          ))}
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {failedRecordsData.rows.map((row, rowIndex) => (
+                          <tr key={rowIndex} className="hover:bg-red-50/30 transition-colors">
+                            {failedRecordsData.columns.map((column, colIndex) => (
+                              <td
+                                key={colIndex}
+                                className="px-6 py-3 border-r border-slate-100 last:border-0 text-slate-600 font-mono text-sm"
+                              >
+                                {row[column.name] === null ? (
+                                  <span className="text-slate-400 italic">NULL</span>
+                                ) : column.name === "IS_CRITICAL" ? (
+                                  <span className={`px-2 py-1 rounded text-xs font-semibold ${row[column.name] ? "bg-red-100 text-red-700" : "bg-slate-100 text-slate-600"
+                                    }`}>
+                                    {row[column.name] ? "CRITICAL" : "Normal"}
+                                  </span>
+                                ) : column.name === "CAN_AUTO_REMEDIATE" ? (
+                                  <span className={`px-2 py-1 rounded text-xs font-semibold ${row[column.name] ? "bg-green-100 text-green-700" : "bg-slate-100 text-slate-600"
+                                    }`}>
+                                    {row[column.name] ? "Yes" : "No"}
+                                  </span>
+                                ) : typeof row[column.name] === "object" ? (
+                                  <span className="text-slate-600">
+                                    {JSON.stringify(row[column.name])}
+                                  </span>
+                                ) : (
+                                  <span className="text-slate-900">
+                                    {String(row[column.name])}
+                                  </span>
+                                )}
+                              </td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  <div className="p-3 bg-slate-50 border-t border-slate-200 text-xs text-slate-500 flex justify-center">
+                    Showing {failedRecordsData.rows.length} failed records (Limit 100)
+                  </div>
+                </>
               )}
             </Card>
-          </>
-        )}
-      </div>
+          )
+        }
+
+        {/* Activity Tab */}
+        {
+          activeTab === "activity" && (
+            <>
+              <Card className="overflow-hidden border border-slate-200 shadow-md">
+                {isLoadingActivity ? (
+                  <div className="flex items-center justify-center h-64 p-6">
+                    <div className="text-center">
+                      <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-500 mx-auto mb-4"></div>
+                      <p className="text-sm text-slate-500">Loading activity...</p>
+                    </div>
+                  </div>
+                ) : activityError ? (
+                  <div className="flex items-center justify-center h-64 p-6">
+                    <div className="text-center">
+                      <p className="text-sm text-red-500 mb-4">{activityError}</p>
+                      <Button onClick={fetchActivity} variant="outline" size="sm">
+                        Retry
+                      </Button>
+                    </div>
+                  </div>
+                ) : activityData.length === 0 ? (
+                  <div className="flex items-center justify-center h-64 p-6">
+                    <div className="text-center">
+                      <Activity size={48} className="text-slate-300 mx-auto mb-4" />
+                      <p className="text-lg font-semibold text-slate-700">No Activity Yet</p>
+                      <p className="text-sm text-slate-500 mt-2">Run a custom scan to see activity here.</p>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <div className="p-4 border-b border-slate-100 bg-slate-50 flex justify-between items-center">
+                      <h3 className="font-bold text-slate-800 flex items-center gap-2">
+                        <Activity size={16} className="text-indigo-600" /> Recent Runs
+                        <span className="text-xs font-normal text-slate-500 ml-2">
+                          ({activityData.length} runs)
+                        </span>
+                      </h3>
+                      <Button
+                        onClick={fetchActivity}
+                        variant="ghost"
+                        className="text-xs h-8 hover:bg-slate-200"
+                      >
+                        <RefreshCw size={14} className="mr-1" /> Refresh
+                      </Button>
+                    </div>
+
+                    <div className="overflow-x-auto custom-scrollbar">
+                      <table className="w-full text-sm text-left border-collapse">
+                        <thead className="bg-slate-100 sticky top-0 z-10 text-xs font-bold text-slate-700">
+                          <tr>
+                            <th className="px-4 py-3 whitespace-nowrap">Run Type</th>
+                            <th className="px-4 py-3 whitespace-nowrap">Status</th>
+                            <th className="px-4 py-3 whitespace-nowrap">Started At</th>
+                            <th className="px-4 py-3 whitespace-nowrap">Duration</th>
+                            <th className="px-4 py-3 whitespace-nowrap text-center">Total Checks</th>
+                            <th className="px-4 py-3 whitespace-nowrap text-center">Failed</th>
+                            <th className="px-4 py-3 whitespace-nowrap text-center">Warnings</th>
+                            <th className="px-4 py-3 whitespace-nowrap">Triggered By</th>
+                            <th className="px-4 py-3 whitespace-nowrap text-center w-16">Actions</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {activityData.map((run: any) => (
+                            <tr
+                              key={run.run_id}
+                              className={`hover:bg-indigo-50/50 transition-colors cursor-pointer ${selectedRunId === run.run_id ? "bg-indigo-50" : ""
+                                }`}
+                              onClick={() => setSelectedRunId(run.run_id)}
+                            >
+                              <td className="px-4 py-3">
+                                <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold ${run.run_type === "CUSTOM_SCAN"
+                                  ? "bg-purple-100 text-purple-700"
+                                  : run.run_type === "PROFILING"
+                                    ? "bg-teal-100 text-teal-700"
+                                    : "bg-blue-100 text-blue-700"
+                                  }`}>
+                                  {run.run_type === "CUSTOM_SCAN" ? (
+                                    <>
+                                      <Settings size={12} />
+                                      Custom Scan
+                                    </>
+                                  ) : run.run_type === "PROFILING" ? (
+                                    <>
+                                      <BarChart2 size={12} />
+                                      Profiling
+                                    </>
+                                  ) : (
+                                    <>
+                                      <PlayCircle size={12} />
+                                      Full Scan
+                                    </>
+                                  )}
+                                </span>
+                              </td>
+                              <td className="px-4 py-3">
+                                <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold ${run.run_status === "COMPLETED"
+                                  ? "bg-emerald-100 text-emerald-700"
+                                  : run.run_status === "COMPLETED_WITH_FAILURES"
+                                    ? "bg-red-100 text-red-700"
+                                    : run.run_status === "FAILED"
+                                      ? "bg-orange-100 text-orange-700"
+                                      : run.run_status === "RUNNING"
+                                        ? "bg-indigo-100 text-indigo-700"
+                                        : "bg-slate-100 text-slate-700"
+                                  }`}>
+                                  {run.run_status === "COMPLETED" && <CheckCircle2 size={12} />}
+                                  {run.run_status === "COMPLETED_WITH_FAILURES" && <AlertOctagon size={12} />}
+                                  {run.run_status === "FAILED" && <AlertOctagon size={12} />}
+                                  {run.run_status === "COMPLETED"
+                                    ? "Completed"
+                                    : run.run_status === "COMPLETED_WITH_FAILURES"
+                                      ? "Failed Checks"
+                                      : run.run_status === "FAILED"
+                                        ? "Failed"
+                                        : run.run_status}
+                                </span>
+                              </td>
+                              <td className="px-4 py-3 text-slate-600">
+                                {formatUtcToLocal(run.start_ts)}
+                              </td>
+                              <td className="px-4 py-3 text-slate-600 font-mono">
+                                {run.duration_seconds !== null && run.duration_seconds !== undefined
+                                  ? `${run.duration_seconds.toFixed(2)}s`
+                                  : "-"}
+                              </td>
+                              <td className="px-4 py-3 text-center font-semibold text-slate-900">
+                                {run.total_checks ?? 0}
+                              </td>
+                              <td className="px-4 py-3 text-center">
+                                <span className={`font-semibold ${(run.failed_checks ?? 0) > 0 ? "text-red-600" : "text-slate-500"
+                                  }`}>
+                                  {run.failed_checks ?? 0}
+                                </span>
+                              </td>
+                              <td className="px-4 py-3 text-center">
+                                <span className={`font-semibold ${(run.warning_checks ?? 0) > 0 ? "text-yellow-600" : "text-slate-500"
+                                  }`}>
+                                  {run.warning_checks ?? 0}
+                                </span>
+                              </td>
+                              <td className="px-4 py-3 text-slate-600">
+                                {run.triggered_by || "-"}
+                              </td>
+                              <td className="px-4 py-3 text-center">
+                                <DropdownMenu>
+                                  <DropdownMenuTrigger asChild>
+                                    <Button
+                                      variant="ghost"
+                                      size="sm"
+                                      className="h-8 w-8 p-0 hover:bg-slate-200"
+                                      onClick={(e) => e.stopPropagation()}
+                                    >
+                                      {isRerunning === run.run_id ? (
+                                        <Loader2 className="h-4 w-4 animate-spin" />
+                                      ) : (
+                                        <MoreVertical className="h-4 w-4" />
+                                      )}
+                                    </Button>
+                                  </DropdownMenuTrigger>
+                                  <DropdownMenuContent align="end" className="w-40 bg-white">
+                                    <DropdownMenuItem
+                                      className="cursor-pointer flex items-center gap-2"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleViewResults(run.run_id);
+                                      }}
+                                    >
+                                      <Eye className="h-4 w-4" />
+                                      View Results
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem
+                                      className="cursor-pointer flex items-center gap-2"
+                                      disabled={isRerunning !== null}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleRerun(run.run_id);
+                                      }}
+                                    >
+                                      <RefreshCw className={`h-4 w-4 ${isRerunning === run.run_id ? "animate-spin" : ""}`} />
+                                      Rerun
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem
+                                      className="cursor-pointer flex items-center gap-2"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        // Pre-fill schedule from run context
+                                        setNewSchedule(prev => ({
+                                          ...prev,
+                                          scanType: run.scan_type || "profiling",
+                                        }));
+                                        setScheduleFromRun(run);
+                                        setShowScheduleModal(true);
+                                      }}
+                                    >
+                                      <Calendar className="h-4 w-4" />
+                                      Schedule
+                                    </DropdownMenuItem>
+                                  </DropdownMenuContent>
+                                </DropdownMenu>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    {selectedRunId && (
+                      <div className="p-3 bg-indigo-50 border-t border-indigo-100 text-xs text-indigo-700 flex items-center justify-between">
+                        <span className="font-mono">Selected Run: {selectedRunId}</span>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="text-xs h-7 text-indigo-700 hover:bg-indigo-100"
+                          onClick={() => setSelectedRunId(null)}
+                        >
+                          Clear Selection
+                        </Button>
+                      </div>
+                    )}
+
+                    <div className="p-3 bg-slate-50 border-t border-slate-200 text-xs text-slate-500 flex justify-center">
+                      Showing {activityData.length} recent runs (Limit 20)
+                    </div>
+                  </>
+                )}
+              </Card>
+
+              {/* Scheduled Scans Panel */}
+              <Card className="overflow-hidden border border-slate-200 shadow-md mt-4">
+                <div className="p-4 border-b border-slate-100 bg-slate-50 flex justify-between items-center">
+                  <h3 className="font-bold text-slate-800 flex items-center gap-2">
+                    <Calendar size={16} className="text-indigo-600" /> Scheduled Scans
+                    <span className="text-xs font-normal text-slate-500 ml-2">
+                      ({schedulesData.filter(s => s.status === 'active').length} active)
+                    </span>
+                  </h3>
+                  <Button
+                    size="sm"
+                    onClick={() => setShowScheduleModal(true)}
+                    className="bg-indigo-600 hover:bg-indigo-700 text-white"
+                  >
+                    <Plus size={14} className="mr-1" /> New Schedule
+                  </Button>
+                </div>
+
+                {isLoadingSchedules ? (
+                  <div className="flex items-center justify-center h-32 p-6">
+                    <div className="text-center">
+                      <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-indigo-500 mx-auto mb-3"></div>
+                      <p className="text-sm text-slate-500">Loading schedules...</p>
+                    </div>
+                  </div>
+                ) : schedulesData.length === 0 ? (
+                  <div className="flex items-center justify-center h-32 p-6">
+                    <div className="text-center">
+                      <Calendar size={32} className="text-slate-300 mx-auto mb-3" />
+                      <p className="text-sm font-medium text-slate-700">No Scheduled Scans</p>
+                      <p className="text-xs text-slate-500 mt-1">Create a schedule to automate your scans</p>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead className="bg-slate-50 text-slate-600 text-xs uppercase">
+                        <tr>
+                          <th className="px-4 py-3 text-left font-semibold">Scan Type</th>
+                          <th className="px-4 py-3 text-left font-semibold">Frequency</th>
+                          <th className="px-4 py-3 text-left font-semibold">Next Run</th>
+                          <th className="px-4 py-3 text-left font-semibold">Last Run</th>
+                          <th className="px-4 py-3 text-left font-semibold">Status</th>
+                          <th className="px-4 py-3 text-center font-semibold">Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {schedulesData.map((schedule: any) => (
+                          <tr key={schedule.scheduleId} className="hover:bg-slate-50 transition-colors">
+                            <td className="px-4 py-3">
+                              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-indigo-50 text-indigo-700">
+                                {schedule.scanType === 'profiling' && <Database size={12} />}
+                                {schedule.scanType === 'checks' && <CheckCircle size={12} />}
+                                {schedule.scanType === 'anomalies' && <Activity size={12} />}
+                                {schedule.scanType === 'full' && <Play size={12} />}
+                                {schedule.scanType.charAt(0).toUpperCase() + schedule.scanType.slice(1)}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3 text-slate-700">
+                              <div className="flex items-center gap-1.5">
+                                <Clock size={12} className="text-slate-400" />
+                                {schedule.scheduleType === 'hourly' && 'Every hour'}
+                                {schedule.scheduleType === 'daily' && `Daily at ${schedule.scheduleTime || '00:00'}`}
+                                {schedule.scheduleType === 'weekly' && `Weekly on ${schedule.scheduleDayOfWeek || 'Mon'}`}
+                                {schedule.scheduleType === 'once' && 'One-time'}
+                              </div>
+                            </td>
+                            <td className="px-4 py-3 text-slate-600 text-xs">
+                              {schedule.nextRunAt ? formatUtcToLocal(schedule.nextRunAt) : '-'}
+                            </td>
+                            <td className="px-4 py-3 text-slate-600 text-xs">
+                              {schedule.lastRunAt ? formatUtcToLocal(schedule.lastRunAt) : 'Never'}
+                            </td>
+                            <td className="px-4 py-3">
+                              <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium ${schedule.status === 'active'
+                                ? 'bg-green-50 text-green-700'
+                                : schedule.status === 'paused'
+                                  ? 'bg-amber-50 text-amber-700'
+                                  : 'bg-slate-100 text-slate-500'
+                                }`}>
+                                {schedule.status === 'active' && <CheckCircle size={10} />}
+                                {schedule.status === 'paused' && <Pause size={10} />}
+                                {schedule.status.charAt(0).toUpperCase() + schedule.status.slice(1)}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3">
+                              <div className="flex items-center justify-center gap-1">
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  className="h-7 px-2 text-green-600 hover:text-green-700 hover:bg-green-50"
+                                  onClick={() => runScheduleNow(schedule.scheduleId)}
+                                  title="Run Now"
+                                >
+                                  <PlayCircle size={14} />
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  className="h-7 px-2 text-slate-500 hover:text-slate-700 hover:bg-slate-100"
+                                  onClick={() => toggleSchedule(schedule.scheduleId, schedule.status)}
+                                  title={schedule.status === 'active' ? 'Pause' : 'Resume'}
+                                >
+                                  {schedule.status === 'active' ? <Pause size={14} /> : <Play size={14} />}
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  className="h-7 px-2 text-red-500 hover:text-red-700 hover:bg-red-50"
+                                  onClick={() => deleteSchedule(schedule.scheduleId)}
+                                  title="Delete"
+                                >
+                                  <Trash2 size={14} />
+                                </Button>
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </Card>
+            </>
+          )
+        }
+      </div >
       {/* Results Modal */}
-      <Dialog open={isResultsModalOpen} onOpenChange={setIsResultsModalOpen}>
+      < Dialog open={isResultsModalOpen} onOpenChange={setIsResultsModalOpen} >
         <DialogContent className="max-w-4xl max-h-[85vh] overflow-hidden flex flex-col bg-white">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
@@ -3078,10 +3221,10 @@ export default function TableDetailsPage() {
             </div>
           )}
         </DialogContent>
-      </Dialog>
+      </Dialog >
 
       {/* Schedule Creation Modal - Enterprise Wizard */}
-      <Dialog open={showScheduleModal} onOpenChange={(open) => {
+      < Dialog open={showScheduleModal} onOpenChange={(open) => {
         setShowScheduleModal(open);
         if (!open) setScheduleWizardStep(1);
       }}>
@@ -3117,31 +3260,155 @@ export default function TableDetailsPage() {
               <h4 className="font-semibold text-slate-800">Scan Configuration</h4>
 
               <div>
-                <label className="block text-sm font-medium text-slate-700 mb-1.5">Scan Type</label>
-                <div className="space-y-2">
+                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Scan Type</label>
+                <div className="flex items-center gap-2 overflow-x-auto pb-1">
                   {["profiling", "custom", "checks", "anomalies", "full"].map((type) => (
-                    <label key={type} className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${newSchedule.scanType === type ? "border-indigo-500 bg-indigo-50" : "border-slate-200 hover:bg-slate-50"
-                      }`}>
-                      <input
-                        type="radio"
-                        name="scanType"
-                        value={type}
-                        checked={newSchedule.scanType === type}
-                        onChange={(e) => setNewSchedule(prev => ({ ...prev, scanType: e.target.value }))}
-                        className="w-4 h-4 text-indigo-600"
-                      />
-                      <span className="text-sm font-medium capitalize">{type === "full" ? "Full Scan" : type}</span>
-                    </label>
+                    <button
+                      key={type}
+                      type="button"
+                      onClick={() => setNewSchedule(prev => ({ ...prev, scanType: type }))}
+                      className={`flex-1 px-3 py-2 rounded-lg border text-sm font-medium whitespace-nowrap transition-all ${newSchedule.scanType === type
+                        ? "border-indigo-600 bg-indigo-50 text-indigo-700 shadow-sm ring-1 ring-indigo-600"
+                        : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50 hover:border-slate-300"
+                        }`}
+                    >
+                      {type === "full" ? "Full Scan" : type.charAt(0).toUpperCase() + type.slice(1)}
+                    </button>
                   ))}
                 </div>
               </div>
 
-              <div className="bg-slate-50 rounded-lg p-3 text-sm">
-                <p className="text-slate-600 font-medium mb-1">Applies To</p>
-                <p className="text-slate-800">Database: <span className="font-mono">{databaseName}</span></p>
-                <p className="text-slate-800">Schema: <span className="font-mono">{schemaName}</span></p>
-                <p className="text-slate-800">Table: <span className="font-mono">{tableName}</span></p>
+              <div className="bg-slate-50 rounded-lg p-2.5 text-xs flex items-center flex-wrap gap-2 border border-slate-100 mt-2">
+                <span className="text-slate-500 font-medium uppercase tracking-wider">Target:</span>
+                <div className="flex items-center gap-1 font-mono text-slate-700">
+                  <span>{databaseName}</span>
+                  <span className="text-slate-300">/</span>
+                  <span>{schemaName}</span>
+                  <span className="text-slate-300">/</span>
+                  <span className="font-bold text-indigo-700">{tableName}</span>
+                </div>
               </div>
+
+              {/* Custom Rule Selection (Only for Custom/Checks) */}
+              {(newSchedule.scanType === "custom" || newSchedule.scanType === "checks") && (
+                <div className="space-y-3 pt-2 border-t border-slate-100">
+                  <div className="flex items-center justify-between">
+                    <label className="block text-sm font-medium text-slate-700">Select Rules to Run</label>
+                    <div className="text-xs text-slate-500">
+                      {newSchedule.customRules.length} selected
+                    </div>
+                  </div>
+
+                  {/* Scope Toggle */}
+                  <div className="flex items-center gap-2 p-1 bg-slate-100 rounded-lg w-fit">
+                    <button
+                      onClick={() => setNewSchedule(prev => ({ ...prev, scope: "table" }))}
+                      className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all ${newSchedule.scope === "table"
+                        ? "bg-white text-indigo-700 shadow-sm"
+                        : "text-slate-500 hover:text-slate-700"
+                        }`}
+                    >
+                      All Rules
+                    </button>
+                    <button
+                      onClick={() => setNewSchedule(prev => ({ ...prev, scope: "columns" }))}
+                      className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all ${newSchedule.scope === "columns"
+                        ? "bg-white text-indigo-700 shadow-sm"
+                        : "text-slate-500 hover:text-slate-700"
+                        }`}
+                    >
+                      Specific Columns
+                    </button>
+                  </div>
+
+                  {/* Selection List (Rules or Columns) */}
+                  <div className="border rounded-lg max-h-60 overflow-y-auto bg-white">
+                    {newSchedule.scope === "columns" ? (
+                      // COLUMN SELECTION
+                      availableColumns.length === 0 ? (
+                        <div className="p-8 text-center text-slate-500 text-sm">
+                          No columns found for this table.
+                        </div>
+                      ) : (
+                        <div className="divide-y divide-slate-50">
+                          {availableColumns.map((colName) => (
+                            <label key={colName} className="flex items-center gap-3 p-3 hover:bg-slate-50 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={newSchedule.selectedColumns.includes(colName)}
+                                onChange={(e) => {
+                                  if (e.target.checked) {
+                                    setNewSchedule(prev => ({ ...prev, selectedColumns: [...prev.selectedColumns, colName] }));
+                                  } else {
+                                    setNewSchedule(prev => ({ ...prev, selectedColumns: prev.selectedColumns.filter(c => c !== colName) }));
+                                  }
+                                }}
+                                className="w-4 h-4 text-indigo-600 rounded border-slate-300"
+                              />
+                              <span className="text-sm font-medium text-slate-700 font-mono">{colName}</span>
+                            </label>
+                          ))}
+                        </div>
+                      )
+                    ) : (
+                      // RULE SELECTION
+                      Object.entries(groupedRules).length === 0 ? (
+                        <div className="p-8 text-center text-slate-500 text-sm">
+                          No rules configured. Please add rules in the Checks tab first.
+                        </div>
+                      ) : (
+                        Object.entries(groupedRules).map(([type, typeRules]) => (
+                          <div key={type} className="border-b border-slate-50 last:border-0">
+                            <div className="px-3 py-2 bg-slate-50 text-xs font-semibold text-slate-600 sticky top-0">
+                              {type}
+                            </div>
+                            <div className="divide-y divide-slate-50">
+                              {typeRules.map((rule: any) => (
+                                <label key={rule.rule_id} className="flex items-start gap-3 p-3 hover:bg-slate-50 cursor-pointer">
+                                  <input
+                                    type="checkbox"
+                                    checked={newSchedule.customRules.includes(rule.rule_id)}
+                                    onChange={(e) => {
+                                      if (e.target.checked) {
+                                        setNewSchedule(prev => ({ ...prev, customRules: [...prev.customRules, rule.rule_id] }));
+                                      } else {
+                                        setNewSchedule(prev => ({ ...prev, customRules: prev.customRules.filter(id => id !== rule.rule_id) }));
+                                      }
+                                    }}
+                                    className="mt-0.5 w-4 h-4 text-indigo-600 rounded border-slate-300"
+                                  />
+                                  <div>
+                                    <div className="text-sm font-medium text-slate-800">{rule.rule_name}</div>
+                                    <div className="text-xs text-slate-500">
+                                      {rule.column_name ? `Column: ${rule.column_name}` : "Table Level"}
+                                      {rule.threshold_value && ` • Threshold: ${rule.threshold_value}`}
+                                    </div>
+                                  </div>
+                                </label>
+                              ))}
+                            </div>
+                          </div>
+                        ))
+                      ))}
+                  </div>
+                  {/* Select All / Clear */}
+                  <div className="flex items-center gap-2 text-xs">
+                    <button
+                      className="text-indigo-600 hover:text-indigo-800"
+                      onClick={() => setNewSchedule(prev => ({ ...prev, customRules: rules.map(r => r.rule_id) }))}
+                    >
+                      Select All
+                    </button>
+                    <span className="text-slate-300">|</span>
+                    <button
+                      className="text-slate-500 hover:text-slate-700"
+                      onClick={() => setNewSchedule(prev => ({ ...prev, customRules: [] }))}
+                    >
+                      Clear Selection
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -3474,7 +3741,7 @@ export default function TableDetailsPage() {
             )}
           </div>
         </DialogContent>
-      </Dialog>
-    </div>
+      </Dialog >
+    </div >
   );
 }

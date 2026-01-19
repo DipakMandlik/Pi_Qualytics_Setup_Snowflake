@@ -83,31 +83,74 @@ export function RunCheckDialog({ isOpen, onClose, database, schema, table, colum
                 .filter(r => selectedRules.includes(r.rule_id))
                 .map(r => r.rule_name);
 
-            const payload = {
-                dataset_id: `${database}.${schema}.${table}`,
-                database,
-                schema,
-                table,
-                column,
-                rule_names: selectedRuleNames
-            };
-
-            const res = await fetch('/api/dq/run-custom-scan', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
-
-            const json = await res.json();
-
-            if (json.success) {
-                if (onSuccess) onSuccess(json.data.results);
-                onClose(); // Close dialog to show results in main panel
-            } else {
-                setError(json.error || 'Scan failed to start');
+            // Resolve dataset_id from DATASET_CONFIG
+            let resolvedDatasetId = `${database}.${schema}.${table}`;
+            try {
+                const datasetRes = await fetch(
+                    `/api/dq/dataset-by-table?database=${encodeURIComponent(database)}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}`
+                );
+                const datasetJson = await datasetRes.json();
+                if (datasetJson?.success && datasetJson.data?.dataset_id) {
+                    resolvedDatasetId = datasetJson.data.dataset_id;
+                }
+            } catch (e) {
+                console.warn('Could not resolve dataset_id, using default');
             }
-        } catch (e) {
-            setError('Failed to execute scan');
+
+            // Execute rules one by one using the working endpoint
+            const results = [];
+            for (const rule_name of selectedRuleNames) {
+                try {
+                    const res = await fetch('/api/dq/run-custom-rule', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            dataset_id: resolvedDatasetId,
+                            rule_name: rule_name,
+                            column_name: column,
+                            threshold: 0.0, // Use 0.0 for ADHOC (accept any pass rate)
+                            run_mode: 'ADHOC'
+                        })
+                    });
+
+                    const json = await res.json();
+
+                    if (json.success) {
+                        // Parse the stored procedure response
+                        let runMeta: any = {};
+                        if (json.data && json.data[0]) {
+                            if (json.data[0].SP_RUN_CUSTOM_RULE) {
+                                runMeta = JSON.parse(json.data[0].SP_RUN_CUSTOM_RULE);
+                            } else {
+                                runMeta = json.data[0];
+                            }
+                        }
+
+                        results.push({
+                            rule: rule_name,
+                            success: true,
+                            daa: [runMeta]
+                        });
+                    } else {
+                        results.push({
+                            rule: rule_name,
+                            success: false,
+                            error: json.error
+                        });
+                    }
+                } catch (ruleError: any) {
+                    results.push({
+                        rule: rule_name,
+                        success: false,
+                        error: ruleError.message
+                    });
+                }
+            }
+
+            if (onSuccess) onSuccess(results);
+            onClose(); // Close dialog to show results in main panel
+        } catch (e: any) {
+            setError(e.message || 'Failed to execute scan');
         } finally {
             setIsScanning(false);
         }
